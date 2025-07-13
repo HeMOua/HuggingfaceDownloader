@@ -288,22 +288,13 @@ class MultiThreadDownloadManager(QObject):
         self.active_workers.clear()
 
 
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget,
-                             QTreeWidgetItem, QPushButton, QLineEdit, QLabel,
-                             QHeaderView, QMessageBox, QTextEdit)
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QIcon
-import os
-from collections import defaultdict
-from typing import List
-
-
 class TreeFileSelectionDialog(QDialog):
     """树状文件选择对话框"""
 
-    def __init__(self, files: List[str], parent=None):
+    def __init__(self, files: List[str], file_sizes: Dict[str, int] = None, parent=None):
         super().__init__(parent)
         self.all_files = files
+        self.file_sizes = file_sizes or {}
         self.selected_files = []
         self.file_tree = {}
         self.build_file_tree()
@@ -422,6 +413,10 @@ class TreeFileSelectionDialog(QDialog):
         # 统计信息
         self.stats_label = QLabel()
         batch_layout.addWidget(self.stats_label)
+        
+        # 总大小信息
+        self.total_size_label = QLabel()
+        batch_layout.addWidget(self.total_size_label)
 
         layout.addLayout(batch_layout)
 
@@ -429,7 +424,7 @@ class TreeFileSelectionDialog(QDialog):
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderLabels(["文件/文件夹", "大小", "类型"])
         header = self.tree_widget.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self.tree_widget.setColumnWidth(1, 100)
@@ -487,19 +482,25 @@ class TreeFileSelectionDialog(QDialog):
                 # 设置文件类型和大小信息
                 ext = os.path.splitext(name)[1].lower()
                 if ext in ['.bin', '.safetensors', '.pth', '.ckpt']:
-                    item.setText(1, "模型文件")
+                    item.setText(2, "模型文件")
                 elif ext in ['.json', '.yaml', '.yml', '.toml', '.ini']:
-                    item.setText(1, "配置文件")
+                    item.setText(2, "配置文件")
                 elif 'tokenizer' in name.lower():
-                    item.setText(1, "分词器文件")
+                    item.setText(2, "分词器文件")
                 elif ext in ['.txt', '.md', '.readme']:
-                    item.setText(1, "文档文件")
+                    item.setText(2, "文档文件")
                 elif ext in ['.py', '.js', '.cpp', '.c', '.java']:
-                    item.setText(1, "代码文件")
+                    item.setText(2, "代码文件")
                 elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-                    item.setText(1, "图片文件")
+                    item.setText(2, "图片文件")
                 else:
-                    item.setText(1, "其他文件")
+                    item.setText(2, "其他文件")
+                
+                # 显示文件大小
+                if file_path in self.file_sizes:
+                    size_bytes = self.file_sizes[file_path]
+                    size_text = self.format_file_size(size_bytes)
+                    item.setText(1, f"{size_text}")
             else:
                 # 这是一个文件夹
                 item.setText(1, "")
@@ -648,6 +649,15 @@ class TreeFileSelectionDialog(QDialog):
         total_files = len(self.all_files)
         selected_count = len(self.selected_files)
         self.stats_label.setText(f"已选择: {selected_count} / {total_files} 个文件")
+        
+        # 计算选中文件的总大小
+        total_size = 0
+        for file_path in self.selected_files:
+            if file_path in self.file_sizes:
+                total_size += self.file_sizes[file_path]
+        
+        total_size_text = self.format_file_size(total_size)
+        self.total_size_label.setText(f"总大小: {total_size_text}")
 
     def preview_selected(self):
         """预览选中文件"""
@@ -674,7 +684,12 @@ class TreeFileSelectionDialog(QDialog):
         for folder, files in grouped_files.items():
             preview_content += f"📁 {folder}/\n"
             for file in files:
-                preview_content += f"  📄 {file}\n"
+                file_path = os.path.join(folder, file) if folder != '根目录' else file
+                size_text = ""
+                if file_path in self.file_sizes:
+                    size_bytes = self.file_sizes[file_path]
+                    size_text = f" ({self.format_file_size(size_bytes)})"
+                preview_content += f"  📄 {file}{size_text}\n"
             preview_content += "\n"
 
         preview_text.setPlainText(preview_content)
@@ -688,9 +703,18 @@ class TreeFileSelectionDialog(QDialog):
         dialog.setLayout(layout)
         dialog.exec()
 
+    def format_file_size(self, size_bytes: int) -> str:
+        """格式化文件大小"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} PB"
+
     def get_selected_files(self) -> List[str]:
         """获取选中的文件列表"""
         return self.selected_files.copy()
+
 
 class ProxyConfigWidget(QWidget):
     """代理配置组件"""
@@ -1048,12 +1072,29 @@ class HuggingFaceDownloader(QMainWindow):
                 os.environ['HTTP_PROXY'] = proxy_url
                 os.environ['HTTPS_PROXY'] = proxy_url
 
-            # 获取文件列表
-            files = list_repo_files(repo_id)
-            self.log(f"获取到 {len(files)} 个文件")
+            # 获取仓库信息和文件列表
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                repo_info = api.model_info(repo_id=repo_id, revision=self.revision_input.text().strip(), files_metadata=True)
+                
+                # 从 repo_info.siblings 中提取文件列表和大小信息
+                files = []
+                file_sizes = {}
+                
+                for file in repo_info.siblings:
+                    files.append(file.rfilename)
+                    file_sizes[file.rfilename] = file.size
+                
+                self.log(f"获取到 {len(files)} 个文件")
+                self.log(f"已获取 {len(file_sizes)} 个文件的大小信息")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"获取仓库信息失败: {str(e)}")
+                return
 
             # 使用树状文件选择对话框
-            dialog = TreeFileSelectionDialog(files, self)
+            dialog = TreeFileSelectionDialog(files, file_sizes, self)
             if dialog.exec() == dialog.DialogCode.Accepted:
                 selected_files = dialog.get_selected_files()
                 if selected_files:
