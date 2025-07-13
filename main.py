@@ -4,9 +4,11 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse
+import concurrent.futures
+from collections import defaultdict
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
@@ -14,15 +16,17 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
     QGroupBox, QCheckBox, QSpinBox, QComboBox, QFileDialog,
     QMessageBox, QSplitter, QFrame, QScrollArea, QListWidget,
-    QListWidgetItem, QDialog, QGridLayout
+    QListWidgetItem, QDialog, QGridLayout, QTreeWidget, QTreeWidgetItem,
+    QStyledItemDelegate, QStyleOptionViewItem
 )
 from PyQt6.QtCore import (
-    QThread, pyqtSignal, QTimer, Qt, QSettings, QSize
+    QThread, pyqtSignal, QTimer, Qt, QSettings, QSize, QRect, QMutex,
+    QThreadPool, QRunnable, QObject
 )
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPalette, QColor
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QPalette, QColor, QPainter
 
 try:
-    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
+    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download, repo_info
     from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
     import requests
 except ImportError:
@@ -41,54 +45,656 @@ class DownloadTask:
     size: int = 0
     downloaded: int = 0
     speed: str = "0 B/s"
+    task_id: str = ""
+
+    def __post_init__(self):
+        if not self.task_id:
+            self.task_id = f"{self.repo_id}:{self.filename}"
 
 
-class DownloadWorker(QThread):
-    progress_updated = pyqtSignal(int, float, str, str)  # task_index, progress, speed, status
-    task_completed = pyqtSignal(int, bool, str)  # task_index, success, message
+class ProgressItemDelegate(QStyledItemDelegate):
+    """自定义进度条委托"""
 
-    def __init__(self, tasks: List[DownloadTask], proxy_config: Dict):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        if index.column() == 3:  # 进度列
+            progress_data = index.data(Qt.ItemDataRole.UserRole)
+            if progress_data is not None:
+                progress_value = float(progress_data)
+
+                # 绘制进度条
+                progress_rect = QRect(option.rect)
+                progress_rect.setWidth(int(progress_rect.width() * progress_value / 100))
+
+                # 背景
+                painter.fillRect(option.rect, QColor(60, 60, 60))
+
+                # 进度条
+                if progress_value > 0:
+                    color = QColor(42, 130, 218) if progress_value < 100 else QColor(46, 125, 50)
+                    painter.fillRect(progress_rect, color)
+
+                # 文本
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, f"{progress_value:.1f}%")
+                return
+
+        super().paint(painter, option, index)
+
+
+class DownloadWorkerSignals(QObject):
+    """下载线程信号"""
+    progress_updated = pyqtSignal(str, float, str, str, int, int)  # task_id, progress, speed, status, downloaded, total
+    task_completed = pyqtSignal(str, bool, str)  # task_id, success, message
+    task_started = pyqtSignal(str)  # task_id
+
+
+class SingleDownloadWorker(QRunnable):
+    """单个文件下载工作线程"""
+
+    def __init__(self, task: DownloadTask, proxy_config: Dict, signals: DownloadWorkerSignals):
         super().__init__()
-        self.tasks = tasks
+        self.task = task
         self.proxy_config = proxy_config
+        self.signals = signals
         self.is_cancelled = False
 
     def run(self):
-        for i, task in enumerate(self.tasks):
-            if self.is_cancelled:
-                break
+        try:
+            self.signals.task_started.emit(self.task.task_id)
+            self.signals.progress_updated.emit(
+                self.task.task_id, 0, "0 B/s", "准备下载", 0, 0
+            )
 
-            try:
-                self.progress_updated.emit(i, 0, "0 B/s", "下载中")
+            # 设置代理
+            if self.proxy_config.get('enabled', False):
+                proxy_url = self.proxy_config.get('url', '')
+                if proxy_url:
+                    os.environ['HTTP_PROXY'] = proxy_url
+                    os.environ['HTTPS_PROXY'] = proxy_url
 
-                # 设置代理
-                if self.proxy_config.get('enabled', False):
-                    proxy_url = self.proxy_config.get('url', '')
-                    if proxy_url:
-                        os.environ['HTTP_PROXY'] = proxy_url
-                        os.environ['HTTPS_PROXY'] = proxy_url
+            # 创建自定义的下载函数，支持进度回调
+            def progress_callback(downloaded: int, total: int):
+                if self.is_cancelled:
+                    return False
 
-                # 下载文件
-                local_path = hf_hub_download(
-                    repo_id=task.repo_id,
-                    filename=task.filename,
-                    local_dir=task.local_dir,
-                    revision=task.revision,
-                    resume_download=True
+                if total > 0:
+                    progress = (downloaded / total) * 100
+                    speed = self.calculate_speed(downloaded)
+                    self.signals.progress_updated.emit(
+                        self.task.task_id, progress, speed, "下载中", downloaded, total
+                    )
+                return True
+
+            # 下载文件
+            local_path = self.download_with_progress(progress_callback)
+
+            if not self.is_cancelled:
+                self.signals.progress_updated.emit(
+                    self.task.task_id, 100, "完成", "已完成", 0, 0
+                )
+                self.signals.task_completed.emit(
+                    self.task.task_id, True, f"下载完成: {local_path}"
                 )
 
-                self.progress_updated.emit(i, 100, "完成", "已完成")
-                self.task_completed.emit(i, True, f"下载完成: {local_path}")
+        except Exception as e:
+            self.signals.progress_updated.emit(
+                self.task.task_id, 0, "错误", "失败", 0, 0
+            )
+            self.signals.task_completed.emit(
+                self.task.task_id, False, f"下载失败: {str(e)}"
+            )
 
-            except Exception as e:
-                self.progress_updated.emit(i, 0, "错误", "失败")
-                self.task_completed.emit(i, False, f"下载失败: {str(e)}")
+    def download_with_progress(self, progress_callback):
+        """带进度回调的下载函数"""
+        try:
+            # 首先获取文件信息
+            from huggingface_hub import HfApi
+            api = HfApi()
+
+            # 使用自定义下载逻辑
+            import urllib.request
+            from urllib.parse import urljoin
+
+            # 构建下载URL
+            base_url = f"https://huggingface.co/{self.task.repo_id}/resolve/{self.task.revision}/"
+            file_url = urljoin(base_url, self.task.filename)
+
+            # 创建本地目录
+            local_dir = Path(self.task.local_dir) / self.task.repo_id
+            local_dir.mkdir(parents=True, exist_ok=True)
+
+            local_file_path = local_dir / self.task.filename
+
+            # 如果文件已存在，检查是否需要断点续传
+            resume_byte_pos = 0
+            if local_file_path.exists():
+                resume_byte_pos = local_file_path.stat().st_size
+
+            # 创建请求
+            req = urllib.request.Request(file_url)
+            if resume_byte_pos > 0:
+                req.add_header('Range', f'bytes={resume_byte_pos}-')
+
+            # 发送请求
+            with urllib.request.urlopen(req) as response:
+                total_size = int(response.headers.get('content-length', 0))
+                if resume_byte_pos > 0:
+                    total_size += resume_byte_pos
+
+                downloaded = resume_byte_pos
+
+                # 打开本地文件
+                mode = 'ab' if resume_byte_pos > 0 else 'wb'
+                with open(local_file_path, mode) as f:
+                    while True:
+                        if self.is_cancelled:
+                            break
+
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # 调用进度回调
+                        if not progress_callback(downloaded, total_size):
+                            break
+
+            return str(local_file_path)
+
+        except Exception as e:
+            # fallback到原始方法
+            return hf_hub_download(
+                repo_id=self.task.repo_id,
+                filename=self.task.filename,
+                local_dir=self.task.local_dir,
+                revision=self.task.revision,
+                resume_download=True
+            )
+
+    def calculate_speed(self, downloaded: int) -> str:
+        """计算下载速度"""
+        if not hasattr(self, '_start_time'):
+            self._start_time = time.time()
+            self._last_downloaded = 0
+            return "0 B/s"
+
+        current_time = time.time()
+        time_diff = current_time - self._start_time
+
+        if time_diff > 0:
+            speed_bps = (downloaded - self._last_downloaded) / time_diff
+            return self.format_speed(speed_bps)
+
+        return "0 B/s"
+
+    def format_speed(self, speed_bps: float) -> str:
+        """格式化速度"""
+        for unit in ['B/s', 'KB/s', 'MB/s', 'GB/s']:
+            if speed_bps < 1024.0:
+                return f"{speed_bps:.1f} {unit}"
+            speed_bps /= 1024.0
+        return f"{speed_bps:.1f} TB/s"
 
     def cancel(self):
         self.is_cancelled = True
 
 
+class MultiThreadDownloadManager(QObject):
+    """多线程下载管理器"""
+    all_completed = pyqtSignal()
+
+    def __init__(self, max_workers: int = 3):
+        super().__init__()
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(max_workers)
+        self.signals = DownloadWorkerSignals()
+        self.active_workers: Dict[str, SingleDownloadWorker] = {}
+        self.completed_tasks = 0
+        self.total_tasks = 0
+
+    def start_downloads(self, tasks: List[DownloadTask], proxy_config: Dict):
+        """开始多线程下载"""
+        self.total_tasks = len(tasks)
+        self.completed_tasks = 0
+
+        for task in tasks:
+            worker = SingleDownloadWorker(task, proxy_config, self.signals)
+            self.active_workers[task.task_id] = worker
+
+            # 连接完成信号
+            self.signals.task_completed.connect(self._on_task_completed)
+
+            self.thread_pool.start(worker)
+
+    def _on_task_completed(self, task_id: str, success: bool, message: str):
+        """任务完成处理"""
+        self.completed_tasks += 1
+        if task_id in self.active_workers:
+            del self.active_workers[task_id]
+
+        if self.completed_tasks >= self.total_tasks:
+            self.all_completed.emit()
+
+    def cancel_all(self):
+        """取消所有下载"""
+        for worker in self.active_workers.values():
+            worker.cancel()
+        self.thread_pool.waitForDone(3000)
+        self.active_workers.clear()
+
+
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget,
+                             QTreeWidgetItem, QPushButton, QLineEdit, QLabel,
+                             QHeaderView, QMessageBox, QTextEdit)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
+import os
+from collections import defaultdict
+from typing import List
+
+
+class TreeFileSelectionDialog(QDialog):
+    """树状文件选择对话框"""
+
+    def __init__(self, files: List[str], parent=None):
+        super().__init__(parent)
+        self.all_files = files
+        self.selected_files = []
+        self.file_tree = {}
+        self.build_file_tree()
+        self.init_ui()
+        self.populate_tree()
+
+    def build_file_tree(self):
+        """构建文件树结构"""
+        self.file_tree = {}
+
+        for file_path in self.all_files:
+            parts = file_path.split('/')
+            current = self.file_tree
+
+            for i, part in enumerate(parts):
+                if part not in current:
+                    current[part] = {} if i < len(parts) - 1 else {'__is_file__': True, '__path__': file_path}
+                current = current[part]
+
+    def get_file_icon(self, filename: str) -> QIcon:
+        """根据文件扩展名返回对应的图标"""
+        # 使用系统标准图标或自定义图标
+        style = self.style()
+
+        if os.path.isdir(filename):
+            return style.standardIcon(style.StandardPixmap.SP_DirIcon)
+
+        ext = os.path.splitext(filename)[1].lower()
+
+        # 根据文件扩展名设置不同图标
+        if ext in ['.bin', '.safetensors', '.pth', '.ckpt']:
+            # 模型文件 - 使用计算机图标
+            return style.standardIcon(style.StandardPixmap.SP_ComputerIcon)
+        elif ext in ['.json', '.yaml', '.yml', '.toml', '.ini']:
+            # 配置文件 - 使用文档图标
+            return style.standardIcon(style.StandardPixmap.SP_FileDialogDetailedView)
+        elif ext in ['.txt', '.md', '.readme']:
+            # 文本文件
+            return style.standardIcon(style.StandardPixmap.SP_FileIcon)
+        elif ext in ['.py', '.js', '.cpp', '.c', '.java']:
+            # 代码文件
+            return style.standardIcon(style.StandardPixmap.SP_FileDialogListView)
+        elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            # 图片文件
+            return style.standardIcon(style.StandardPixmap.SP_FileDialogDetailedView)
+        elif 'tokenizer' in filename.lower():
+            # 分词器文件
+            return style.standardIcon(style.StandardPixmap.SP_DialogApplyButton)
+        else:
+            # 其他文件
+            return style.standardIcon(style.StandardPixmap.SP_FileIcon)
+
+    def get_folder_icon(self) -> QIcon:
+        """获取文件夹图标"""
+        style = self.style()
+        return style.standardIcon(style.StandardPixmap.SP_DirIcon)
+
+    def sort_tree_items(self, items: list) -> list:
+        """自定义排序：文件夹在前，文件在后，同类型按字母序"""
+        folders = []
+        files = []
+
+        for name, content in items:
+            if isinstance(content, dict) and content.get('__is_file__'):
+                files.append((name, content))
+            else:
+                folders.append((name, content))
+
+        # 分别对文件夹和文件进行字母排序
+        folders.sort(key=lambda x: x[0].lower())
+        files.sort(key=lambda x: x[0].lower())
+
+        # 文件夹在前，文件在后
+        return folders + files
+
+    def init_ui(self):
+        self.setWindowTitle("选择文件 - 树状结构")
+        self.setGeometry(200, 200, 900, 700)
+
+        layout = QVBoxLayout()
+
+        # 顶部控制区域
+        control_layout = QHBoxLayout()
+
+        # 搜索
+        control_layout.addWidget(QLabel("搜索:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("输入文件名进行搜索...")
+        self.search_input.textChanged.connect(self.filter_tree)
+        control_layout.addWidget(self.search_input)
+
+        # 展开/折叠按钮
+        expand_all_btn = QPushButton("展开所有")
+        expand_all_btn.clicked.connect(self.expand_all)
+        control_layout.addWidget(expand_all_btn)
+
+        collapse_all_btn = QPushButton("折叠所有")
+        collapse_all_btn.clicked.connect(self.collapse_all)
+        control_layout.addWidget(collapse_all_btn)
+
+        layout.addLayout(control_layout)
+
+        # 批量操作
+        batch_layout = QHBoxLayout()
+
+        select_all_btn = QPushButton("全选所有文件")
+        select_all_btn.clicked.connect(self.select_all_files)
+        batch_layout.addWidget(select_all_btn)
+
+        deselect_all_btn = QPushButton("取消所有选择")
+        deselect_all_btn.clicked.connect(self.deselect_all_files)
+        batch_layout.addWidget(deselect_all_btn)
+
+        batch_layout.addStretch()
+
+        # 统计信息
+        self.stats_label = QLabel()
+        batch_layout.addWidget(self.stats_label)
+
+        layout.addLayout(batch_layout)
+
+        # 文件树
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderLabels(["文件/文件夹", "大小", "类型"])
+        header = self.tree_widget.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.tree_widget.setColumnWidth(1, 100)
+        self.tree_widget.setColumnWidth(2, 100)
+        self.tree_widget.itemChanged.connect(self.on_item_changed)
+        layout.addWidget(self.tree_widget)
+
+        # 底部按钮
+        button_layout = QHBoxLayout()
+
+        # 预览按钮
+        preview_btn = QPushButton("预览选中文件")
+        preview_btn.clicked.connect(self.preview_selected)
+        button_layout.addWidget(preview_btn)
+
+        button_layout.addStretch()
+
+        ok_btn = QPushButton("确定")
+        ok_btn.clicked.connect(self.accept)
+        button_layout.addWidget(ok_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def populate_tree(self):
+        """填充树状结构"""
+        self.tree_widget.clear()
+        self._create_tree_items(self.file_tree, self.tree_widget)
+        self.update_stats()
+
+    def _create_tree_items(self, tree_dict: dict, parent_item):
+        """递归创建树项目"""
+        # 获取所有项目并排序
+        items = [(name, content) for name, content in tree_dict.items() if not name.startswith('__')]
+        sorted_items = self.sort_tree_items(items)
+
+        for name, content in sorted_items:
+            item = QTreeWidgetItem(parent_item)
+            item.setText(0, name)
+
+            if isinstance(content, dict) and content.get('__is_file__'):
+                # 这是一个文件
+                file_path = content['__path__']
+                item.setText(2, "文件")
+                item.setData(0, Qt.ItemDataRole.UserRole, file_path)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+
+                # 设置文件图标
+                item.setIcon(0, self.get_file_icon(name))
+
+                # 设置文件类型和大小信息
+                ext = os.path.splitext(name)[1].lower()
+                if ext in ['.bin', '.safetensors', '.pth', '.ckpt']:
+                    item.setText(1, "模型文件")
+                elif ext in ['.json', '.yaml', '.yml', '.toml', '.ini']:
+                    item.setText(1, "配置文件")
+                elif 'tokenizer' in name.lower():
+                    item.setText(1, "分词器文件")
+                elif ext in ['.txt', '.md', '.readme']:
+                    item.setText(1, "文档文件")
+                elif ext in ['.py', '.js', '.cpp', '.c', '.java']:
+                    item.setText(1, "代码文件")
+                elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+                    item.setText(1, "图片文件")
+                else:
+                    item.setText(1, "其他文件")
+            else:
+                # 这是一个文件夹
+                item.setText(1, "")
+                item.setText(2, "文件夹")
+                item.setData(0, Qt.ItemDataRole.UserRole, None)
+
+                # 设置文件夹图标
+                item.setIcon(0, self.get_folder_icon())
+
+                # 设置部分选中状态
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+
+                # 递归创建子项目
+                self._create_tree_items(content, item)
+
+    def on_item_changed(self, item: QTreeWidgetItem, column: int):
+        """处理项目状态变化"""
+        if column == 0:  # 复选框列
+            file_path = item.data(0, Qt.ItemDataRole.UserRole)
+
+            if file_path:  # 这是一个文件
+                if item.checkState(0) == Qt.CheckState.Checked:
+                    if file_path not in self.selected_files:
+                        self.selected_files.append(file_path)
+                else:
+                    if file_path in self.selected_files:
+                        self.selected_files.remove(file_path)
+            else:  # 这是一个文件夹
+                self._update_children_state(item, item.checkState(0))
+
+            self._update_parent_state(item)
+            self.update_stats()
+
+    def _update_children_state(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
+        """更新子项目状态"""
+        for i in range(parent_item.childCount()):
+            child = parent_item.child(i)
+            child.setCheckState(0, state)
+
+            file_path = child.data(0, Qt.ItemDataRole.UserRole)
+            if file_path:  # 这是文件
+                if state == Qt.CheckState.Checked:
+                    if file_path not in self.selected_files:
+                        self.selected_files.append(file_path)
+                else:
+                    if file_path in self.selected_files:
+                        self.selected_files.remove(file_path)
+            else:  # 这是文件夹
+                self._update_children_state(child, state)
+
+    def _update_parent_state(self, item: QTreeWidgetItem):
+        """更新父项目状态"""
+        parent = item.parent()
+        if not parent:
+            return
+
+        # 检查同级项目的状态
+        checked_count = 0
+        partially_checked_count = 0
+        total_count = parent.childCount()
+
+        for i in range(total_count):
+            child = parent.child(i)
+            state = child.checkState(0)
+            if state == Qt.CheckState.Checked:
+                checked_count += 1
+            elif state == Qt.CheckState.PartiallyChecked:
+                partially_checked_count += 1
+
+        # 设置父项目状态
+        if checked_count == total_count:
+            parent.setCheckState(0, Qt.CheckState.Checked)
+        elif checked_count > 0 or partially_checked_count > 0:
+            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        else:
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+
+        # 递归更新上级父项目
+        self._update_parent_state(parent)
+
+    def filter_tree(self):
+        """过滤树状结构"""
+        search_text = self.search_input.text().lower()
+        self._filter_tree_items(self.tree_widget.invisibleRootItem(), search_text)
+
+    def _filter_tree_items(self, parent_item, search_text: str) -> bool:
+        """递归过滤树项目"""
+        has_visible_child = False
+
+        for i in range(parent_item.childCount()):
+            child = parent_item.child(i)
+            child_name = child.text(0).lower()
+
+            # 检查子项目
+            child_has_visible = self._filter_tree_items(child, search_text)
+
+            # 检查当前项目是否匹配
+            current_matches = search_text in child_name if search_text else True
+
+            # 显示/隐藏项目
+            should_show = current_matches or child_has_visible
+            child.setHidden(not should_show)
+
+            if should_show:
+                has_visible_child = True
+
+        return has_visible_child
+
+    def expand_all(self):
+        """展开所有项目"""
+        self.tree_widget.expandAll()
+
+    def collapse_all(self):
+        """折叠所有项目"""
+        self.tree_widget.collapseAll()
+
+    def select_all_files(self):
+        """选择所有文件"""
+        self.selected_files.clear()
+        self._select_all_items(self.tree_widget.invisibleRootItem(), True)
+        self.update_stats()
+
+    def deselect_all_files(self):
+        """取消选择所有文件"""
+        self.selected_files.clear()
+        self._select_all_items(self.tree_widget.invisibleRootItem(), False)
+        self.update_stats()
+
+    def _select_all_items(self, parent_item, select: bool):
+        """递归选择/取消选择所有项目"""
+        for i in range(parent_item.childCount()):
+            child = parent_item.child(i)
+            file_path = child.data(0, Qt.ItemDataRole.UserRole)
+
+            state = Qt.CheckState.Checked if select else Qt.CheckState.Unchecked
+            child.setCheckState(0, state)
+
+            if file_path and select:
+                if file_path not in self.selected_files:
+                    self.selected_files.append(file_path)
+
+            self._select_all_items(child, select)
+
+    def update_stats(self):
+        """更新统计信息"""
+        total_files = len(self.all_files)
+        selected_count = len(self.selected_files)
+        self.stats_label.setText(f"已选择: {selected_count} / {total_files} 个文件")
+
+    def preview_selected(self):
+        """预览选中文件"""
+        if not self.selected_files:
+            QMessageBox.information(self, "预览", "没有选中任何文件")
+            return
+
+        # 创建预览对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("已选择的文件")
+        dialog.setGeometry(300, 300, 600, 500)
+
+        layout = QVBoxLayout()
+
+        # 按文件夹分组显示
+        grouped_files = defaultdict(list)
+        for file_path in sorted(self.selected_files):
+            folder = os.path.dirname(file_path) if '/' in file_path else '根目录'
+            grouped_files[folder].append(os.path.basename(file_path))
+
+        preview_text = QTextEdit()
+        preview_content = f"共选择 {len(self.selected_files)} 个文件：\n\n"
+
+        for folder, files in grouped_files.items():
+            preview_content += f"📁 {folder}/\n"
+            for file in files:
+                preview_content += f"  📄 {file}\n"
+            preview_content += "\n"
+
+        preview_text.setPlainText(preview_content)
+        preview_text.setReadOnly(True)
+        layout.addWidget(preview_text)
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def get_selected_files(self) -> List[str]:
+        """获取选中的文件列表"""
+        return self.selected_files.copy()
+
 class ProxyConfigWidget(QWidget):
+    """代理配置组件"""
+
     def __init__(self):
         super().__init__()
         self.init_ui()
@@ -155,10 +761,10 @@ class ProxyConfigWidget(QWidget):
         self.proxy_enabled.toggled.connect(proxy_group.setEnabled)
         proxy_group.setEnabled(False)
 
+        layout.addStretch()
         self.setLayout(layout)
 
     def test_proxy(self):
-        # 测试代理连接
         try:
             proxy_url = self.get_proxy_url()
             if proxy_url:
@@ -196,403 +802,26 @@ class ProxyConfigWidget(QWidget):
     def get_config(self) -> Dict:
         return {
             'enabled': self.proxy_enabled.isChecked(),
-            'url': self.get_proxy_url()
+            'proxy_host': self.proxy_host.text().strip(),
+            'proxy_port': self.proxy_port.value(),
+            'url': self.get_proxy_url(),
         }
-
-
-class AdvancedFileSelectionDialog(QDialog):
-    def __init__(self, files: List[str], parent=None):
-        super().__init__(parent)
-        self.all_files = files
-        self.filtered_files = files.copy()
-        self.selected_files = []
-        self.current_page = 0
-        self.files_per_page = 100  # 默认每页显示100个文件
-        self.init_ui()
-        self.update_file_list()
-
-    def init_ui(self):
-        self.setWindowTitle("选择文件")
-        self.setGeometry(200, 200, 800, 600)
-
-        layout = QVBoxLayout()
-
-        # 顶部控制区域
-        control_layout = QVBoxLayout()
-
-        # 搜索和过滤区域
-        search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("搜索文件:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入文件名或扩展名进行搜索...")
-        self.search_input.textChanged.connect(self.filter_files)
-        search_layout.addWidget(self.search_input)
-
-        # 清除搜索按钮
-        clear_search_btn = QPushButton("清除")
-        clear_search_btn.clicked.connect(self.clear_search)
-        search_layout.addWidget(clear_search_btn)
-
-        control_layout.addLayout(search_layout)
-
-        # 文件类型过滤
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("文件类型:"))
-
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems([
-            "所有文件", "模型文件 (.bin, .safetensors)", "配置文件 (.json, .yaml)",
-            "分词器 (tokenizer)", "权重文件 (.pth, .ckpt)", "其他"
-        ])
-        self.filter_combo.currentTextChanged.connect(self.filter_files)
-        filter_layout.addWidget(self.filter_combo)
-
-        filter_layout.addStretch()
-
-        # 每页显示数量
-        filter_layout.addWidget(QLabel("每页显示:"))
-        self.page_size_combo = QComboBox()
-        self.page_size_combo.addItems(["50", "100", "200", "500", "1000", "全部"])
-        self.page_size_combo.setCurrentText("100")
-        self.page_size_combo.currentTextChanged.connect(self.change_page_size)
-        filter_layout.addWidget(self.page_size_combo)
-
-        control_layout.addLayout(filter_layout)
-
-        # 统计信息
-        self.stats_label = QLabel()
-        control_layout.addWidget(self.stats_label)
-
-        layout.addLayout(control_layout)
-
-        # 文件列表区域
-        list_layout = QVBoxLayout()
-
-        # 批量操作按钮
-        batch_layout = QHBoxLayout()
-
-        select_all_btn = QPushButton("全选当前页")
-        select_all_btn.clicked.connect(self.select_current_page)
-        batch_layout.addWidget(select_all_btn)
-
-        deselect_all_btn = QPushButton("取消当前页")
-        deselect_all_btn.clicked.connect(self.deselect_current_page)
-        batch_layout.addWidget(deselect_all_btn)
-
-        select_all_filtered_btn = QPushButton("全选搜索结果")
-        select_all_filtered_btn.clicked.connect(self.select_all_filtered)
-        batch_layout.addWidget(select_all_filtered_btn)
-
-        deselect_all_filtered_btn = QPushButton("取消所有选择")
-        deselect_all_filtered_btn.clicked.connect(self.deselect_all_filtered)
-        batch_layout.addWidget(deselect_all_filtered_btn)
-
-        batch_layout.addStretch()
-
-        # 已选择文件数量
-        self.selected_count_label = QLabel("已选择: 0 个文件")
-        batch_layout.addWidget(self.selected_count_label)
-
-        list_layout.addLayout(batch_layout)
-
-        # 文件列表
-        self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        list_layout.addWidget(self.file_list)
-
-        # 分页控制
-        page_layout = QHBoxLayout()
-
-        self.prev_btn = QPushButton("上一页")
-        self.prev_btn.clicked.connect(self.prev_page)
-        page_layout.addWidget(self.prev_btn)
-
-        self.page_label = QLabel()
-        page_layout.addWidget(self.page_label)
-
-        self.next_btn = QPushButton("下一页")
-        self.next_btn.clicked.connect(self.next_page)
-        page_layout.addWidget(self.next_btn)
-
-        page_layout.addStretch()
-
-        # 跳转到页面
-        page_layout.addWidget(QLabel("跳转到:"))
-        self.page_input = QSpinBox()
-        self.page_input.setMinimum(1)
-        self.page_input.valueChanged.connect(self.jump_to_page)
-        page_layout.addWidget(self.page_input)
-
-        list_layout.addLayout(page_layout)
-        layout.addLayout(list_layout)
-
-        # 底部按钮
-        button_layout = QHBoxLayout()
-
-        # 预览选中文件
-        preview_btn = QPushButton("预览选中文件")
-        preview_btn.clicked.connect(self.preview_selected)
-        button_layout.addWidget(preview_btn)
-
-        button_layout.addStretch()
-
-        ok_btn = QPushButton("确定")
-        ok_btn.clicked.connect(self.accept)
-        button_layout.addWidget(ok_btn)
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_btn)
-
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-
-    def filter_files(self):
-        """过滤文件"""
-        search_text = self.search_input.text().lower()
-        file_type = self.filter_combo.currentText()
-
-        self.filtered_files = []
-
-        for file in self.all_files:
-            # 搜索过滤
-            if search_text and search_text not in file.lower():
-                continue
-
-            # 文件类型过滤
-            if file_type == "模型文件 (.bin, .safetensors)":
-                if not (file.endswith('.bin') or file.endswith('.safetensors')):
-                    continue
-            elif file_type == "配置文件 (.json, .yaml)":
-                if not (file.endswith('.json') or file.endswith('.yaml') or file.endswith('.yml')):
-                    continue
-            elif file_type == "分词器 (tokenizer)":
-                if 'tokenizer' not in file.lower():
-                    continue
-            elif file_type == "权重文件 (.pth, .ckpt)":
-                if not (file.endswith('.pth') or file.endswith('.ckpt')):
-                    continue
-            elif file_type == "其他":
-                common_exts = ['.bin', '.safetensors', '.json', '.yaml', '.yml', '.pth', '.ckpt']
-                if any(file.endswith(ext) for ext in common_exts) or 'tokenizer' in file.lower():
-                    continue
-
-            self.filtered_files.append(file)
-
-        self.current_page = 0
-        self.update_file_list()
-        self.update_page_controls()
-
-    def clear_search(self):
-        """清除搜索"""
-        self.search_input.clear()
-        self.filter_combo.setCurrentIndex(0)
-
-    def change_page_size(self):
-        """改变每页显示数量"""
-        size_text = self.page_size_combo.currentText()
-        if size_text == "全部":
-            self.files_per_page = len(self.filtered_files)
-        else:
-            self.files_per_page = int(size_text)
-
-        self.current_page = 0
-        self.update_file_list()
-        self.update_page_controls()
-
-    def update_file_list(self):
-        """更新文件列表显示"""
-        self.file_list.clear()
-
-        if not self.filtered_files:
-            return
-
-        # 计算当前页的文件
-        start_idx = self.current_page * self.files_per_page
-        end_idx = min(start_idx + self.files_per_page, len(self.filtered_files))
-
-        current_page_files = self.filtered_files[start_idx:end_idx]
-
-        for file in current_page_files:
-            item = QListWidgetItem()
-            checkbox = QCheckBox(file)
-            checkbox.setChecked(file in self.selected_files)
-            checkbox.toggled.connect(lambda checked, f=file: self.toggle_file_selection(f, checked))
-
-            self.file_list.addItem(item)
-            self.file_list.setItemWidget(item, checkbox)
-
-        self.update_stats()
-        self.update_selected_count()
-
-    def update_stats(self):
-        """更新统计信息"""
-        total_files = len(self.all_files)
-        filtered_files = len(self.filtered_files)
-
-        if self.search_input.text() or self.filter_combo.currentIndex() > 0:
-            self.stats_label.setText(f"显示 {filtered_files} / {total_files} 个文件")
-        else:
-            self.stats_label.setText(f"共 {total_files} 个文件")
-
-    def update_page_controls(self):
-        """更新分页控制"""
-        if not self.filtered_files:
-            self.page_label.setText("0 / 0")
-            self.prev_btn.setEnabled(False)
-            self.next_btn.setEnabled(False)
-            self.page_input.setMaximum(0)
-            return
-
-        total_pages = (len(self.filtered_files) - 1) // self.files_per_page + 1
-        current_page_display = self.current_page + 1
-
-        self.page_label.setText(f"{current_page_display} / {total_pages}")
-        self.prev_btn.setEnabled(self.current_page > 0)
-        self.next_btn.setEnabled(self.current_page < total_pages - 1)
-
-        self.page_input.setMaximum(total_pages)
-        self.page_input.setValue(current_page_display)
-
-    def prev_page(self):
-        """上一页"""
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_file_list()
-            self.update_page_controls()
-
-    def next_page(self):
-        """下一页"""
-        total_pages = (len(self.filtered_files) - 1) // self.files_per_page + 1
-        if self.current_page < total_pages - 1:
-            self.current_page += 1
-            self.update_file_list()
-            self.update_page_controls()
-
-    def jump_to_page(self):
-        """跳转到指定页面"""
-        page = self.page_input.value() - 1
-        total_pages = (len(self.filtered_files) - 1) // self.files_per_page + 1
-
-        if 0 <= page < total_pages:
-            self.current_page = page
-            self.update_file_list()
-            self.update_page_controls()
-
-    def toggle_file_selection(self, filename: str, checked: bool):
-        """切换文件选择状态"""
-        if checked and filename not in self.selected_files:
-            self.selected_files.append(filename)
-        elif not checked and filename in self.selected_files:
-            self.selected_files.remove(filename)
-
-        self.update_selected_count()
-
-    def select_current_page(self):
-        """选择当前页所有文件"""
-        start_idx = self.current_page * self.files_per_page
-        end_idx = min(start_idx + self.files_per_page, len(self.filtered_files))
-        current_page_files = self.filtered_files[start_idx:end_idx]
-
-        for file in current_page_files:
-            if file not in self.selected_files:
-                self.selected_files.append(file)
-
-        self.update_file_list()
-
-    def deselect_current_page(self):
-        """取消选择当前页所有文件"""
-        start_idx = self.current_page * self.files_per_page
-        end_idx = min(start_idx + self.files_per_page, len(self.filtered_files))
-        current_page_files = self.filtered_files[start_idx:end_idx]
-
-        for file in current_page_files:
-            if file in self.selected_files:
-                self.selected_files.remove(file)
-
-        self.update_file_list()
-
-    def select_all_filtered(self):
-        """选择所有搜索结果"""
-        for file in self.filtered_files:
-            if file not in self.selected_files:
-                self.selected_files.append(file)
-
-        self.update_file_list()
-
-    def deselect_all_filtered(self):
-        """取消所有选择"""
-        self.selected_files.clear()
-        self.update_file_list()
-
-    def update_selected_count(self):
-        """更新已选择文件数量"""
-        count = len(self.selected_files)
-        self.selected_count_label.setText(f"已选择: {count} 个文件")
-
-    def preview_selected(self):
-        """预览选中的文件"""
-        if not self.selected_files:
-            QMessageBox.information(self, "预览", "没有选中任何文件")
-            return
-
-        # 创建预览对话框
-        dialog = QDialog(self)
-        dialog.setWindowTitle("已选择的文件")
-        dialog.setGeometry(300, 300, 500, 400)
-
-        layout = QVBoxLayout()
-
-        # 文件列表
-        file_list = QTextEdit()
-        file_list.setPlainText('\n'.join(sorted(self.selected_files)))
-        file_list.setReadOnly(True)
-        layout.addWidget(file_list)
-
-        # 统计信息
-        stats_text = f"共选择 {len(self.selected_files)} 个文件"
-        # 按类型统计
-        type_counts = {}
-        for file in self.selected_files:
-            ext = os.path.splitext(file)[1].lower()
-            if not ext:
-                ext = "无扩展名"
-            type_counts[ext] = type_counts.get(ext, 0) + 1
-
-        if type_counts:
-            stats_text += "\n\n文件类型统计："
-            for ext, count in sorted(type_counts.items()):
-                stats_text += f"\n{ext}: {count} 个"
-
-        stats_label = QLabel(stats_text)
-        layout.addWidget(stats_label)
-
-        # 关闭按钮
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-
-        dialog.setLayout(layout)
-        dialog.exec()
-
-    def get_selected_files(self) -> List[str]:
-        """获取选中的文件列表"""
-        return self.selected_files.copy()
 
 
 class HuggingFaceDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.tasks: List[DownloadTask] = []
-        self.download_worker: Optional[DownloadWorker] = None
+        self.tasks: Dict[str, DownloadTask] = {}
+        self.download_manager = MultiThreadDownloadManager(max_workers=4)
         self.settings = QSettings('HFDownloader', 'Config')
 
         self.init_ui()
+        self.setup_connections()
         self.load_settings()
 
     def init_ui(self):
-        self.setWindowTitle("HuggingFace 模型下载器 v1.1")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("HuggingFace 模型下载器 v2.0 - 多线程增强版")
+        self.setGeometry(100, 100, 1400, 900)
 
         # 中央部件
         central_widget = QWidget()
@@ -614,6 +843,10 @@ class HuggingFaceDownloader(QMainWindow):
         self.proxy_widget = ProxyConfigWidget()
         tab_widget.addTab(self.proxy_widget, "代理设置")
 
+        # 设置选项卡
+        settings_tab = self.create_settings_tab()
+        tab_widget.addTab(settings_tab, "设置")
+
         # 状态栏
         self.statusBar().showMessage("就绪")
 
@@ -633,7 +866,7 @@ class HuggingFaceDownloader(QMainWindow):
         repo_layout.addWidget(self.repo_input)
 
         # 浏览文件按钮
-        self.browse_btn = QPushButton("浏览文件")
+        self.browse_btn = QPushButton("🗂️ 浏览文件")
         self.browse_btn.clicked.connect(self.browse_repo_files)
         repo_layout.addWidget(self.browse_btn)
         add_layout.addLayout(repo_layout)
@@ -654,7 +887,7 @@ class HuggingFaceDownloader(QMainWindow):
         self.dir_input.setText("./downloads")
         dir_layout.addWidget(self.dir_input)
 
-        dir_btn = QPushButton("浏览")
+        dir_btn = QPushButton("📁 浏览")
         dir_btn.clicked.connect(self.select_directory)
         dir_layout.addWidget(dir_btn)
 
@@ -667,11 +900,11 @@ class HuggingFaceDownloader(QMainWindow):
 
         # 添加按钮
         btn_layout = QHBoxLayout()
-        add_task_btn = QPushButton("添加到队列")
+        add_task_btn = QPushButton("➕ 添加到队列")
         add_task_btn.clicked.connect(self.add_tasks)
         btn_layout.addWidget(add_task_btn)
 
-        clear_btn = QPushButton("清空队列")
+        clear_btn = QPushButton("🗑️ 清空队列")
         clear_btn.clicked.connect(self.clear_tasks)
         btn_layout.addWidget(clear_btn)
         btn_layout.addStretch()
@@ -686,35 +919,41 @@ class HuggingFaceDownloader(QMainWindow):
 
         # 表格
         self.task_table = QTableWidget()
-        self.task_table.setColumnCount(7)
+        self.task_table.setColumnCount(8)
         self.task_table.setHorizontalHeaderLabels([
-            "仓库", "文件名", "状态", "进度", "大小", "速度", "保存路径"
+            "仓库", "文件名", "状态", "进度", "已下载", "总大小", "速度", "保存路径"
         ])
+
+        # 设置自定义委托
+        self.progress_delegate = ProgressItemDelegate()
+        self.task_table.setItemDelegate(self.progress_delegate)
 
         # 设置列宽
         header = self.task_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(3, 120)  # 进度条列固定宽度
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
         task_layout.addWidget(self.task_table)
 
         # 控制按钮
         control_layout = QHBoxLayout()
-        self.start_btn = QPushButton("开始下载")
+        self.start_btn = QPushButton("🚀 开始下载")
         self.start_btn.clicked.connect(self.start_download)
         control_layout.addWidget(self.start_btn)
 
-        self.pause_btn = QPushButton("暂停下载")
+        self.pause_btn = QPushButton("⏸️ 暂停下载")
         self.pause_btn.clicked.connect(self.pause_download)
         self.pause_btn.setEnabled(False)
         control_layout.addWidget(self.pause_btn)
 
-        self.remove_btn = QPushButton("移除选中")
+        self.remove_btn = QPushButton("❌ 移除选中")
         self.remove_btn.clicked.connect(self.remove_selected_tasks)
         control_layout.addWidget(self.remove_btn)
 
@@ -744,8 +983,55 @@ class HuggingFaceDownloader(QMainWindow):
         widget.setLayout(layout)
         return widget
 
+    def create_settings_tab(self) -> QWidget:
+        """创建设置选项卡"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+
+        # 下载设置
+        download_group = QGroupBox("下载设置")
+        download_layout = QVBoxLayout()
+
+        # 并发数设置
+        concurrent_layout = QHBoxLayout()
+        concurrent_layout.addWidget(QLabel("同时下载任务数:"))
+        self.concurrent_spin = QSpinBox()
+        self.concurrent_spin.setRange(1, 10)
+        self.concurrent_spin.setValue(4)
+        self.concurrent_spin.valueChanged.connect(self.update_concurrent_downloads)
+        concurrent_layout.addWidget(self.concurrent_spin)
+        concurrent_layout.addWidget(QLabel("个"))
+        concurrent_layout.addStretch()
+        download_layout.addLayout(concurrent_layout)
+
+        # 重试设置
+        retry_layout = QHBoxLayout()
+        retry_layout.addWidget(QLabel("下载失败重试次数:"))
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 10)
+        self.retry_spin.setValue(3)
+        retry_layout.addWidget(self.retry_spin)
+        retry_layout.addWidget(QLabel("次"))
+        retry_layout.addStretch()
+        download_layout.addLayout(retry_layout)
+
+        download_group.setLayout(download_layout)
+        layout.addWidget(download_group)
+
+        layout.addStretch()
+        widget.setLayout(layout)
+        return widget
+
+    def setup_connections(self):
+        """设置信号连接"""
+        # 下载管理器信号
+        self.download_manager.signals.progress_updated.connect(self.on_progress_updated)
+        self.download_manager.signals.task_completed.connect(self.on_task_completed)
+        self.download_manager.signals.task_started.connect(self.on_task_started)
+        self.download_manager.all_completed.connect(self.on_all_completed)
+
     def browse_repo_files(self):
-        """浏览仓库文件 - 使用增强版文件选择对话框"""
+        """浏览仓库文件 - 使用树状文件选择对话框"""
         repo_id = self.repo_input.text().strip()
         if not repo_id:
             QMessageBox.warning(self, "警告", "请输入仓库ID")
@@ -756,31 +1042,18 @@ class HuggingFaceDownloader(QMainWindow):
             self.browse_btn.setEnabled(False)
             self.browse_btn.setText("获取中...")
 
-            # 在单独线程中获取文件列表
-            def get_files():
-                try:
-                    # 设置代理
-                    proxy_url = self.proxy_widget.get_proxy_url()
-                    if proxy_url:
-                        os.environ['HTTP_PROXY'] = proxy_url
-                        os.environ['HTTPS_PROXY'] = proxy_url
+            # 设置代理
+            proxy_url = self.proxy_widget.get_proxy_url()
+            if proxy_url:
+                os.environ['HTTP_PROXY'] = proxy_url
+                os.environ['HTTPS_PROXY'] = proxy_url
 
-                    files = list_repo_files(repo_id)
-                    return files, None
-                except Exception as e:
-                    return None, str(e)
-
-            # 这里为了简化，直接调用，实际应该用QThread
-            files, error = get_files()
-
-            if error:
-                QMessageBox.critical(self, "错误", f"获取文件列表失败: {error}")
-                return
-
+            # 获取文件列表
+            files = list_repo_files(repo_id)
             self.log(f"获取到 {len(files)} 个文件")
 
-            # 使用增强版文件选择对话框
-            dialog = AdvancedFileSelectionDialog(files, self)
+            # 使用树状文件选择对话框
+            dialog = TreeFileSelectionDialog(files, self)
             if dialog.exec() == dialog.DialogCode.Accepted:
                 selected_files = dialog.get_selected_files()
                 if selected_files:
@@ -793,7 +1066,7 @@ class HuggingFaceDownloader(QMainWindow):
             QMessageBox.critical(self, "错误", f"获取文件列表失败: {str(e)}")
         finally:
             self.browse_btn.setEnabled(True)
-            self.browse_btn.setText("浏览文件")
+            self.browse_btn.setText("🗂️ 浏览文件")
 
     def select_directory(self):
         """选择保存目录"""
@@ -829,7 +1102,7 @@ class HuggingFaceDownloader(QMainWindow):
                 local_dir=local_dir,
                 revision=revision
             )
-            self.tasks.append(task)
+            self.tasks[task.task_id] = task
 
         self.update_task_table()
         self.log(f"已添加 {len(files)} 个下载任务")
@@ -846,10 +1119,13 @@ class HuggingFaceDownloader(QMainWindow):
         for item in self.task_table.selectedItems():
             selected_rows.add(item.row())
 
+        task_ids = list(self.tasks.keys())
+
         # 从后往前删除，避免索引问题
         for row in sorted(selected_rows, reverse=True):
-            if 0 <= row < len(self.tasks):
-                del self.tasks[row]
+            if 0 <= row < len(task_ids):
+                task_id = task_ids[row]
+                del self.tasks[task_id]
 
         self.update_task_table()
         self.log(f"已移除 {len(selected_rows)} 个任务")
@@ -858,21 +1134,26 @@ class HuggingFaceDownloader(QMainWindow):
         """更新任务表格"""
         self.task_table.setRowCount(len(self.tasks))
 
-        for i, task in enumerate(self.tasks):
+        for i, (task_id, task) in enumerate(self.tasks.items()):
             self.task_table.setItem(i, 0, QTableWidgetItem(task.repo_id))
             self.task_table.setItem(i, 1, QTableWidgetItem(task.filename))
             self.task_table.setItem(i, 2, QTableWidgetItem(task.status))
 
             # 进度条
             progress_item = QTableWidgetItem(f"{task.progress:.1f}%")
+            progress_item.setData(Qt.ItemDataRole.UserRole, task.progress)
             self.task_table.setItem(i, 3, progress_item)
 
-            size_text = self.format_size(task.size) if task.size > 0 else "未知"
-            self.task_table.setItem(i, 4, QTableWidgetItem(size_text))
-            self.task_table.setItem(i, 5, QTableWidgetItem(task.speed))
+            downloaded_text = self.format_size(task.downloaded) if task.downloaded > 0 else "--"
+            self.task_table.setItem(i, 4, QTableWidgetItem(downloaded_text))
+
+            size_text = self.format_size(task.size) if task.size > 0 else "--"
+            self.task_table.setItem(i, 5, QTableWidgetItem(size_text))
+
+            self.task_table.setItem(i, 6, QTableWidgetItem(task.speed))
 
             local_path = os.path.join(task.local_dir, task.repo_id)
-            self.task_table.setItem(i, 6, QTableWidgetItem(local_path))
+            self.task_table.setItem(i, 7, QTableWidgetItem(local_path))
 
     def start_download(self):
         """开始下载"""
@@ -880,59 +1161,87 @@ class HuggingFaceDownloader(QMainWindow):
             QMessageBox.warning(self, "警告", "没有下载任务")
             return
 
-        if self.download_worker and self.download_worker.isRunning():
-            QMessageBox.warning(self, "警告", "下载正在进行中")
+        proxy_config = self.proxy_widget.get_config()
+
+        # 只下载未完成的任务
+        pending_tasks = [task for task in self.tasks.values()
+                         if task.status in ["待下载", "失败"]]
+
+        if not pending_tasks:
+            QMessageBox.information(self, "信息", "所有任务已完成")
             return
 
-        proxy_config = self.proxy_widget.get_config()
-        self.download_worker = DownloadWorker(self.tasks, proxy_config)
-        self.download_worker.progress_updated.connect(self.on_progress_updated)
-        self.download_worker.task_completed.connect(self.on_task_completed)
-        self.download_worker.finished.connect(self.on_download_finished)
-
-        self.download_worker.start()
+        self.download_manager.start_downloads(pending_tasks, proxy_config)
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
 
-        self.log("开始下载...")
+        self.log(f"开始下载 {len(pending_tasks)} 个任务...")
 
     def pause_download(self):
         """暂停下载"""
-        if self.download_worker and self.download_worker.isRunning():
-            self.download_worker.cancel()
-            self.log("正在暂停下载...")
+        self.download_manager.cancel_all()
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.log("下载已暂停")
 
-    def on_progress_updated(self, task_index: int, progress: float, speed: str, status: str):
-        """进度更新"""
-        if 0 <= task_index < len(self.tasks):
-            self.tasks[task_index].progress = progress
-            self.tasks[task_index].speed = speed
-            self.tasks[task_index].status = status
+    def update_concurrent_downloads(self, value: int):
+        """更新并发下载数"""
+        self.download_manager.thread_pool.setMaxThreadCount(value)
+        self.log(f"并发下载数已设置为: {value}")
 
-            # 更新表格中的对应行
-            self.task_table.setItem(task_index, 2, QTableWidgetItem(status))
-            self.task_table.setItem(task_index, 3, QTableWidgetItem(f"{progress:.1f}%"))
-            self.task_table.setItem(task_index, 5, QTableWidgetItem(speed))
+    def on_task_started(self, task_id: str):
+        """任务开始回调"""
+        if task_id in self.tasks:
+            self.tasks[task_id].status = "下载中"
+            self.update_task_table()
 
-    def on_task_completed(self, task_index: int, success: bool, message: str):
-        """任务完成"""
+    def on_progress_updated(self, task_id: str, progress: float, speed: str,
+                            status: str, downloaded: int, total: int):
+        """进度更新回调"""
+        if task_id in self.tasks:
+            task = self.tasks[task_id]
+            task.progress = progress
+            task.speed = speed
+            task.status = status
+            task.downloaded = downloaded
+            task.size = total
+
+            self.update_task_table()
+            self.update_overall_progress()
+
+    def on_task_completed(self, task_id: str, success: bool, message: str):
+        """任务完成回调"""
         self.log(message)
 
-        if 0 <= task_index < len(self.tasks):
+        if task_id in self.tasks:
+            task = self.tasks[task_id]
             if success:
-                self.tasks[task_index].status = "已完成"
-                self.tasks[task_index].progress = 100.0
+                task.status = "已完成"
+                task.progress = 100.0
             else:
-                self.tasks[task_index].status = "失败"
+                task.status = "失败"
+                task.progress = 0.0
 
         self.update_task_table()
         self.update_overall_progress()
 
-    def on_download_finished(self):
-        """下载完成"""
+    def on_all_completed(self):
+        """所有任务完成回调"""
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
-        self.log("下载任务完成")
+        self.log("所有下载任务完成")
+
+        # 显示完成统计
+        completed_count = sum(1 for task in self.tasks.values() if task.status == "已完成")
+        failed_count = sum(1 for task in self.tasks.values() if task.status == "失败")
+
+        QMessageBox.information(
+            self, "下载完成",
+            f"下载任务已完成！\n\n"
+            f"成功: {completed_count} 个\n"
+            f"失败: {failed_count} 个\n"
+            f"总计: {len(self.tasks)} 个"
+        )
 
     def update_overall_progress(self):
         """更新总进度"""
@@ -940,7 +1249,7 @@ class HuggingFaceDownloader(QMainWindow):
             self.overall_progress.setValue(0)
             return
 
-        total_progress = sum(task.progress for task in self.tasks)
+        total_progress = sum(task.progress for task in self.tasks.values())
         overall = total_progress / len(self.tasks)
         self.overall_progress.setValue(int(overall))
 
@@ -963,33 +1272,42 @@ class HuggingFaceDownloader(QMainWindow):
         self.settings.setValue("repo_id", self.repo_input.text())
         self.settings.setValue("local_dir", self.dir_input.text())
         self.settings.setValue("revision", self.revision_input.text())
+        self.settings.setValue("concurrent_downloads", self.concurrent_spin.value())
+        self.settings.setValue("retry_count", self.retry_spin.value())
 
         # 保存代理设置
         proxy_config = self.proxy_widget.get_config()
         self.settings.setValue("proxy_enabled", proxy_config.get('enabled', False))
-        self.settings.setValue("proxy_url", proxy_config.get('url', ''))
+        self.settings.setValue("proxy_host", proxy_config.get('proxy_host', ''))
+        self.settings.setValue("proxy_port", proxy_config.get('proxy_port', ''))
 
     def load_settings(self):
         """加载设置"""
         self.repo_input.setText(self.settings.value("repo_id", ""))
         self.dir_input.setText(self.settings.value("local_dir", "./downloads"))
         self.revision_input.setText(self.settings.value("revision", "main"))
+        self.concurrent_spin.setValue(int(self.settings.value("concurrent_downloads", 4)))
+        self.retry_spin.setValue(int(self.settings.value("retry_count", 3)))
+
+        self.proxy_widget.proxy_enabled.setChecked(bool(self.settings.value("proxy_enabled", False)))
+        self.proxy_widget.proxy_host.setText(self.settings.value("proxy_host", ""))
+        self.proxy_widget.proxy_port.setValue(int(self.settings.value("proxy_port", 7890)))
 
     def closeEvent(self, event):
         """关闭事件"""
         self.save_settings()
 
-        if self.download_worker and self.download_worker.isRunning():
+        # 检查是否有正在下载的任务
+        if any(task.status == "下载中" for task in self.tasks.values()):
             reply = QMessageBox.question(
                 self, "确认退出",
-                "下载正在进行中，确定要退出吗？",
+                "有下载正在进行中，确定要退出吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                self.download_worker.cancel()
-                self.download_worker.wait(3000)  # 等待3秒
+                self.download_manager.cancel_all()
                 event.accept()
             else:
                 event.ignore()
