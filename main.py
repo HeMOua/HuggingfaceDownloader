@@ -25,8 +25,12 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPalette, QColor, QPainter
 
+from ui.components.tree_file_selection_dialog import HuggingfaceFileTreeWidget, HuggingfaceFileDialog
+from ui.proxy_config_widget import ProxyConfigWidget
+from ui.utils import set_black_ui
+
 try:
-    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download, repo_info
+    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download, repo_info, HfApi
     from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
     import requests
 except ImportError:
@@ -244,6 +248,38 @@ class SingleDownloadWorker(QRunnable):
         self.is_cancelled = True
 
 
+class LoadingDialog(QDialog):
+    """加载对话框"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("正在获取仓库信息")
+        self.setFixedSize(300, 120)
+        self.setModal(True)
+        
+        layout = QVBoxLayout()
+        
+        # 加载文本
+        self.loading_label = QLabel("正在获取仓库文件列表，请稍候...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.loading_label)
+        
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)  # 设置为不确定模式
+        layout.addWidget(self.progress_bar)
+        
+        # 取消按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+
 class MultiThreadDownloadManager(QObject):
     """多线程下载管理器"""
     all_completed = pyqtSignal()
@@ -288,548 +324,8 @@ class MultiThreadDownloadManager(QObject):
         self.active_workers.clear()
 
 
-class TreeFileSelectionDialog(QDialog):
-    """树状文件选择对话框"""
 
-    def __init__(self, files: List[str], file_sizes: Dict[str, int] = None, parent=None):
-        super().__init__(parent)
-        self.all_files = files
-        self.file_sizes = file_sizes or {}
-        self.selected_files = []
-        self.file_tree = {}
-        self.build_file_tree()
-        self.init_ui()
-        self.populate_tree()
 
-    def build_file_tree(self):
-        """构建文件树结构"""
-        self.file_tree = {}
-
-        for file_path in self.all_files:
-            parts = file_path.split('/')
-            current = self.file_tree
-
-            for i, part in enumerate(parts):
-                if part not in current:
-                    current[part] = {} if i < len(parts) - 1 else {'__is_file__': True, '__path__': file_path}
-                current = current[part]
-
-    def get_file_icon(self, filename: str) -> QIcon:
-        """根据文件扩展名返回对应的图标"""
-        # 使用系统标准图标或自定义图标
-        style = self.style()
-
-        if os.path.isdir(filename):
-            return style.standardIcon(style.StandardPixmap.SP_DirIcon)
-
-        ext = os.path.splitext(filename)[1].lower()
-
-        # 根据文件扩展名设置不同图标
-        if ext in ['.bin', '.safetensors', '.pth', '.ckpt']:
-            # 模型文件 - 使用计算机图标
-            return style.standardIcon(style.StandardPixmap.SP_ComputerIcon)
-        elif ext in ['.json', '.yaml', '.yml', '.toml', '.ini']:
-            # 配置文件 - 使用文档图标
-            return style.standardIcon(style.StandardPixmap.SP_FileDialogDetailedView)
-        elif ext in ['.txt', '.md', '.readme']:
-            # 文本文件
-            return style.standardIcon(style.StandardPixmap.SP_FileIcon)
-        elif ext in ['.py', '.js', '.cpp', '.c', '.java']:
-            # 代码文件
-            return style.standardIcon(style.StandardPixmap.SP_FileDialogListView)
-        elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-            # 图片文件
-            return style.standardIcon(style.StandardPixmap.SP_FileDialogDetailedView)
-        elif 'tokenizer' in filename.lower():
-            # 分词器文件
-            return style.standardIcon(style.StandardPixmap.SP_DialogApplyButton)
-        else:
-            # 其他文件
-            return style.standardIcon(style.StandardPixmap.SP_FileIcon)
-
-    def get_folder_icon(self) -> QIcon:
-        """获取文件夹图标"""
-        style = self.style()
-        return style.standardIcon(style.StandardPixmap.SP_DirIcon)
-
-    def sort_tree_items(self, items: list) -> list:
-        """自定义排序：文件夹在前，文件在后，同类型按字母序"""
-        folders = []
-        files = []
-
-        for name, content in items:
-            if isinstance(content, dict) and content.get('__is_file__'):
-                files.append((name, content))
-            else:
-                folders.append((name, content))
-
-        # 分别对文件夹和文件进行字母排序
-        folders.sort(key=lambda x: x[0].lower())
-        files.sort(key=lambda x: x[0].lower())
-
-        # 文件夹在前，文件在后
-        return folders + files
-
-    def init_ui(self):
-        self.setWindowTitle("选择文件 - 树状结构")
-        self.setGeometry(200, 200, 900, 700)
-
-        layout = QVBoxLayout()
-
-        # 顶部控制区域
-        control_layout = QHBoxLayout()
-
-        # 搜索
-        control_layout.addWidget(QLabel("搜索:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入文件名进行搜索...")
-        self.search_input.textChanged.connect(self.filter_tree)
-        control_layout.addWidget(self.search_input)
-
-        # 展开/折叠按钮
-        expand_all_btn = QPushButton("展开所有")
-        expand_all_btn.clicked.connect(self.expand_all)
-        control_layout.addWidget(expand_all_btn)
-
-        collapse_all_btn = QPushButton("折叠所有")
-        collapse_all_btn.clicked.connect(self.collapse_all)
-        control_layout.addWidget(collapse_all_btn)
-
-        layout.addLayout(control_layout)
-
-        # 批量操作
-        batch_layout = QHBoxLayout()
-
-        select_all_btn = QPushButton("全选所有文件")
-        select_all_btn.clicked.connect(self.select_all_files)
-        batch_layout.addWidget(select_all_btn)
-
-        deselect_all_btn = QPushButton("取消所有选择")
-        deselect_all_btn.clicked.connect(self.deselect_all_files)
-        batch_layout.addWidget(deselect_all_btn)
-
-        batch_layout.addStretch()
-
-        # 统计信息
-        self.stats_label = QLabel()
-        batch_layout.addWidget(self.stats_label)
-        
-        # 总大小信息
-        self.total_size_label = QLabel()
-        batch_layout.addWidget(self.total_size_label)
-
-        layout.addLayout(batch_layout)
-
-        # 文件树
-        self.tree_widget = QTreeWidget()
-        self.tree_widget.setHeaderLabels(["文件/文件夹", "大小", "类型"])
-        header = self.tree_widget.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        self.tree_widget.setColumnWidth(1, 100)
-        self.tree_widget.setColumnWidth(2, 100)
-        self.tree_widget.itemChanged.connect(self.on_item_changed)
-        layout.addWidget(self.tree_widget)
-
-        # 底部按钮
-        button_layout = QHBoxLayout()
-
-        # 预览按钮
-        preview_btn = QPushButton("预览选中文件")
-        preview_btn.clicked.connect(self.preview_selected)
-        button_layout.addWidget(preview_btn)
-
-        button_layout.addStretch()
-
-        ok_btn = QPushButton("确定")
-        ok_btn.clicked.connect(self.accept)
-        button_layout.addWidget(ok_btn)
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_btn)
-
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-
-    def populate_tree(self):
-        """填充树状结构"""
-        self.tree_widget.clear()
-        self._create_tree_items(self.file_tree, self.tree_widget)
-        self.update_stats()
-
-    def _create_tree_items(self, tree_dict: dict, parent_item):
-        """递归创建树项目"""
-        # 获取所有项目并排序
-        items = [(name, content) for name, content in tree_dict.items() if not name.startswith('__')]
-        sorted_items = self.sort_tree_items(items)
-
-        for name, content in sorted_items:
-            item = QTreeWidgetItem(parent_item)
-            item.setText(0, name)
-
-            if isinstance(content, dict) and content.get('__is_file__'):
-                # 这是一个文件
-                file_path = content['__path__']
-                item.setText(2, "文件")
-                item.setData(0, Qt.ItemDataRole.UserRole, file_path)
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-
-                # 设置文件图标
-                item.setIcon(0, self.get_file_icon(name))
-
-                # 设置文件类型和大小信息
-                ext = os.path.splitext(name)[1].lower()
-                if ext in ['.bin', '.safetensors', '.pth', '.ckpt']:
-                    item.setText(2, "模型文件")
-                elif ext in ['.json', '.yaml', '.yml', '.toml', '.ini']:
-                    item.setText(2, "配置文件")
-                elif 'tokenizer' in name.lower():
-                    item.setText(2, "分词器文件")
-                elif ext in ['.txt', '.md', '.readme']:
-                    item.setText(2, "文档文件")
-                elif ext in ['.py', '.js', '.cpp', '.c', '.java']:
-                    item.setText(2, "代码文件")
-                elif ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-                    item.setText(2, "图片文件")
-                else:
-                    item.setText(2, "其他文件")
-                
-                # 显示文件大小
-                if file_path in self.file_sizes:
-                    size_bytes = self.file_sizes[file_path]
-                    size_text = self.format_file_size(size_bytes)
-                    item.setText(1, f"{size_text}")
-            else:
-                # 这是一个文件夹
-                item.setText(1, "")
-                item.setText(2, "文件夹")
-                item.setData(0, Qt.ItemDataRole.UserRole, None)
-
-                # 设置文件夹图标
-                item.setIcon(0, self.get_folder_icon())
-
-                # 设置部分选中状态
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-
-                # 递归创建子项目
-                self._create_tree_items(content, item)
-
-    def on_item_changed(self, item: QTreeWidgetItem, column: int):
-        """处理项目状态变化"""
-        if column == 0:  # 复选框列
-            file_path = item.data(0, Qt.ItemDataRole.UserRole)
-
-            if file_path:  # 这是一个文件
-                if item.checkState(0) == Qt.CheckState.Checked:
-                    if file_path not in self.selected_files:
-                        self.selected_files.append(file_path)
-                else:
-                    if file_path in self.selected_files:
-                        self.selected_files.remove(file_path)
-            else:  # 这是一个文件夹
-                self._update_children_state(item, item.checkState(0))
-
-            self._update_parent_state(item)
-            self.update_stats()
-
-    def _update_children_state(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
-        """更新子项目状态"""
-        for i in range(parent_item.childCount()):
-            child = parent_item.child(i)
-            child.setCheckState(0, state)
-
-            file_path = child.data(0, Qt.ItemDataRole.UserRole)
-            if file_path:  # 这是文件
-                if state == Qt.CheckState.Checked:
-                    if file_path not in self.selected_files:
-                        self.selected_files.append(file_path)
-                else:
-                    if file_path in self.selected_files:
-                        self.selected_files.remove(file_path)
-            else:  # 这是文件夹
-                self._update_children_state(child, state)
-
-    def _update_parent_state(self, item: QTreeWidgetItem):
-        """更新父项目状态"""
-        parent = item.parent()
-        if not parent:
-            return
-
-        # 检查同级项目的状态
-        checked_count = 0
-        partially_checked_count = 0
-        total_count = parent.childCount()
-
-        for i in range(total_count):
-            child = parent.child(i)
-            state = child.checkState(0)
-            if state == Qt.CheckState.Checked:
-                checked_count += 1
-            elif state == Qt.CheckState.PartiallyChecked:
-                partially_checked_count += 1
-
-        # 设置父项目状态
-        if checked_count == total_count:
-            parent.setCheckState(0, Qt.CheckState.Checked)
-        elif checked_count > 0 or partially_checked_count > 0:
-            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
-        else:
-            parent.setCheckState(0, Qt.CheckState.Unchecked)
-
-        # 递归更新上级父项目
-        self._update_parent_state(parent)
-
-    def filter_tree(self):
-        """过滤树状结构"""
-        search_text = self.search_input.text().lower()
-        self._filter_tree_items(self.tree_widget.invisibleRootItem(), search_text)
-
-    def _filter_tree_items(self, parent_item, search_text: str) -> bool:
-        """递归过滤树项目"""
-        has_visible_child = False
-
-        for i in range(parent_item.childCount()):
-            child = parent_item.child(i)
-            child_name = child.text(0).lower()
-
-            # 检查子项目
-            child_has_visible = self._filter_tree_items(child, search_text)
-
-            # 检查当前项目是否匹配
-            current_matches = search_text in child_name if search_text else True
-
-            # 显示/隐藏项目
-            should_show = current_matches or child_has_visible
-            child.setHidden(not should_show)
-
-            if should_show:
-                has_visible_child = True
-
-        return has_visible_child
-
-    def expand_all(self):
-        """展开所有项目"""
-        self.tree_widget.expandAll()
-
-    def collapse_all(self):
-        """折叠所有项目"""
-        self.tree_widget.collapseAll()
-
-    def select_all_files(self):
-        """选择所有文件"""
-        self.selected_files.clear()
-        self._select_all_items(self.tree_widget.invisibleRootItem(), True)
-        self.update_stats()
-
-    def deselect_all_files(self):
-        """取消选择所有文件"""
-        self.selected_files.clear()
-        self._select_all_items(self.tree_widget.invisibleRootItem(), False)
-        self.update_stats()
-
-    def _select_all_items(self, parent_item, select: bool):
-        """递归选择/取消选择所有项目"""
-        for i in range(parent_item.childCount()):
-            child = parent_item.child(i)
-            file_path = child.data(0, Qt.ItemDataRole.UserRole)
-
-            state = Qt.CheckState.Checked if select else Qt.CheckState.Unchecked
-            child.setCheckState(0, state)
-
-            if file_path and select:
-                if file_path not in self.selected_files:
-                    self.selected_files.append(file_path)
-
-            self._select_all_items(child, select)
-
-    def update_stats(self):
-        """更新统计信息"""
-        total_files = len(self.all_files)
-        selected_count = len(self.selected_files)
-        self.stats_label.setText(f"已选择: {selected_count} / {total_files} 个文件")
-        
-        # 计算选中文件的总大小
-        total_size = 0
-        for file_path in self.selected_files:
-            if file_path in self.file_sizes:
-                total_size += self.file_sizes[file_path]
-        
-        total_size_text = self.format_file_size(total_size)
-        self.total_size_label.setText(f"总大小: {total_size_text}")
-
-    def preview_selected(self):
-        """预览选中文件"""
-        if not self.selected_files:
-            QMessageBox.information(self, "预览", "没有选中任何文件")
-            return
-
-        # 创建预览对话框
-        dialog = QDialog(self)
-        dialog.setWindowTitle("已选择的文件")
-        dialog.setGeometry(300, 300, 600, 500)
-
-        layout = QVBoxLayout()
-
-        # 按文件夹分组显示
-        grouped_files = defaultdict(list)
-        for file_path in sorted(self.selected_files):
-            folder = os.path.dirname(file_path) if '/' in file_path else '根目录'
-            grouped_files[folder].append(os.path.basename(file_path))
-
-        preview_text = QTextEdit()
-        preview_content = f"共选择 {len(self.selected_files)} 个文件：\n\n"
-
-        for folder, files in grouped_files.items():
-            preview_content += f"📁 {folder}/\n"
-            for file in files:
-                file_path = os.path.join(folder, file) if folder != '根目录' else file
-                size_text = ""
-                if file_path in self.file_sizes:
-                    size_bytes = self.file_sizes[file_path]
-                    size_text = f" ({self.format_file_size(size_bytes)})"
-                preview_content += f"  📄 {file}{size_text}\n"
-            preview_content += "\n"
-
-        preview_text.setPlainText(preview_content)
-        preview_text.setReadOnly(True)
-        layout.addWidget(preview_text)
-
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-
-        dialog.setLayout(layout)
-        dialog.exec()
-
-    def format_file_size(self, size_bytes: int) -> str:
-        """格式化文件大小"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.1f} PB"
-
-    def get_selected_files(self) -> List[str]:
-        """获取选中的文件列表"""
-        return self.selected_files.copy()
-
-
-class ProxyConfigWidget(QWidget):
-    """代理配置组件"""
-
-    def __init__(self):
-        super().__init__()
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout()
-
-        # 代理启用
-        self.proxy_enabled = QCheckBox("启用代理")
-        layout.addWidget(self.proxy_enabled)
-
-        # 代理配置组
-        proxy_group = QGroupBox("代理设置")
-        proxy_layout = QVBoxLayout()
-
-        # 代理类型
-        type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("代理类型:"))
-        self.proxy_type = QComboBox()
-        self.proxy_type.addItems(["HTTP", "HTTPS", "SOCKS5"])
-        type_layout.addWidget(self.proxy_type)
-        type_layout.addStretch()
-        proxy_layout.addLayout(type_layout)
-
-        # 代理地址
-        addr_layout = QHBoxLayout()
-        addr_layout.addWidget(QLabel("代理地址:"))
-        self.proxy_host = QLineEdit()
-        self.proxy_host.setPlaceholderText("127.0.0.1")
-        addr_layout.addWidget(self.proxy_host)
-        addr_layout.addWidget(QLabel("端口:"))
-        self.proxy_port = QSpinBox()
-        self.proxy_port.setRange(1, 65535)
-        self.proxy_port.setValue(7890)
-        addr_layout.addWidget(self.proxy_port)
-        proxy_layout.addLayout(addr_layout)
-
-        # 认证
-        auth_layout = QHBoxLayout()
-        self.auth_enabled = QCheckBox("需要认证")
-        auth_layout.addWidget(self.auth_enabled)
-        auth_layout.addStretch()
-        proxy_layout.addLayout(auth_layout)
-
-        user_layout = QHBoxLayout()
-        user_layout.addWidget(QLabel("用户名:"))
-        self.username = QLineEdit()
-        user_layout.addWidget(self.username)
-        user_layout.addWidget(QLabel("密码:"))
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        user_layout.addWidget(self.password)
-        proxy_layout.addLayout(user_layout)
-
-        # 测试按钮
-        self.test_btn = QPushButton("测试连接")
-        self.test_btn.clicked.connect(self.test_proxy)
-        proxy_layout.addWidget(self.test_btn)
-
-        proxy_group.setLayout(proxy_layout)
-        layout.addWidget(proxy_group)
-
-        # 启用状态控制
-        self.proxy_enabled.toggled.connect(proxy_group.setEnabled)
-        proxy_group.setEnabled(False)
-
-        layout.addStretch()
-        self.setLayout(layout)
-
-    def test_proxy(self):
-        try:
-            proxy_url = self.get_proxy_url()
-            if proxy_url:
-                proxies = {'http': proxy_url, 'https': proxy_url}
-                response = requests.get('https://httpbin.org/ip',
-                                        proxies=proxies, timeout=10)
-                if response.status_code == 200:
-                    QMessageBox.information(self, "测试结果", "代理连接成功！")
-                else:
-                    QMessageBox.warning(self, "测试结果", "代理连接失败！")
-            else:
-                QMessageBox.warning(self, "测试结果", "请配置代理地址！")
-        except Exception as e:
-            QMessageBox.critical(self, "测试结果", f"代理测试失败: {str(e)}")
-
-    def get_proxy_url(self) -> str:
-        if not self.proxy_enabled.isChecked():
-            return ""
-
-        protocol = self.proxy_type.currentText().lower()
-        host = self.proxy_host.text().strip()
-        port = self.proxy_port.value()
-
-        if not host:
-            return ""
-
-        if self.auth_enabled.isChecked():
-            username = self.username.text().strip()
-            password = self.password.text().strip()
-            if username and password:
-                return f"{protocol}://{username}:{password}@{host}:{port}"
-
-        return f"{protocol}://{host}:{port}"
-
-    def get_config(self) -> Dict:
-        return {
-            'enabled': self.proxy_enabled.isChecked(),
-            'proxy_host': self.proxy_host.text().strip(),
-            'proxy_port': self.proxy_port.value(),
-            'url': self.get_proxy_url(),
-        }
 
 
 class HuggingFaceDownloader(QMainWindow):
@@ -1062,47 +558,25 @@ class HuggingFaceDownloader(QMainWindow):
             return
 
         try:
-            self.log("正在获取仓库文件列表...")
-            self.browse_btn.setEnabled(False)
-            self.browse_btn.setText("获取中...")
-
             # 设置代理
             proxy_url = self.proxy_widget.get_proxy_url()
             if proxy_url:
                 os.environ['HTTP_PROXY'] = proxy_url
                 os.environ['HTTPS_PROXY'] = proxy_url
 
-            # 获取仓库信息和文件列表
-            try:
-                from huggingface_hub import HfApi
-                api = HfApi()
-                repo_info = api.model_info(repo_id=repo_id, revision=self.revision_input.text().strip(), files_metadata=True)
-                
-                # 从 repo_info.siblings 中提取文件列表和大小信息
-                files = []
-                file_sizes = {}
-                
-                for file in repo_info.siblings:
-                    files.append(file.rfilename)
-                    file_sizes[file.rfilename] = file.size
-                
-                self.log(f"获取到 {len(files)} 个文件")
-                self.log(f"已获取 {len(file_sizes)} 个文件的大小信息")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"获取仓库信息失败: {str(e)}")
-                return
+            # 显示加载状态
+            self.log("正在获取仓库文件列表...")
+            self.browse_btn.setEnabled(False)
+            self.browse_btn.setText("获取中...")
 
             # 使用树状文件选择对话框
-            dialog = TreeFileSelectionDialog(files, file_sizes, self)
-            if dialog.exec() == dialog.DialogCode.Accepted:
-                selected_files = dialog.get_selected_files()
-                if selected_files:
-                    self.files_input.setPlainText('\n'.join(selected_files))
-                    self.log(f"已选择 {len(selected_files)} 个文件")
-                else:
-                    self.log("未选择任何文件")
+            selected_files = HuggingfaceFileDialog.select_files_simple(self.repo_input.text(), self.revision_input.text())
 
+            if selected_files:
+                self.files_input.setPlainText('\n'.join(selected_files))
+                self.log(f"已选择 {len(selected_files)} 个文件")
+            else:
+                self.log("未选择任何文件")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"获取文件列表失败: {str(e)}")
         finally:
@@ -1365,21 +839,7 @@ def main():
     app.setStyle('Fusion')
 
     # 深色主题
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(0, 0, 0))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
-    app.setPalette(palette)
+    set_black_ui(app)
 
     window = HuggingFaceDownloader()
     window.show()
