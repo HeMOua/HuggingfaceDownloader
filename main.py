@@ -1,14 +1,11 @@
 import sys
 import os
-import json
-import threading
 import time
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from dataclasses import dataclass
-from urllib.parse import urlparse
-import concurrent.futures
-from collections import defaultdict
+import json
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
@@ -23,19 +20,12 @@ from PyQt6.QtCore import (
     QThread, pyqtSignal, QTimer, Qt, QSettings, QSize, QRect, QMutex,
     QThreadPool, QRunnable, QObject
 )
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPalette, QColor, QPainter
-
-from ui.components.tree_file_selection_dialog import HuggingfaceFileTreeWidget, HuggingfaceFileDialog
+from PyQt6.QtGui import QColor, QPainter, QFont
+from urllib.parse import urljoin
+from ui.components.tree_file_selection_dialog import HuggingfaceFileDialog
 from ui.proxy_config_widget import ProxyConfigWidget
 from ui.utils import set_black_ui
-
-try:
-    from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download, repo_info, HfApi
-    from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
-    import requests
-except ImportError:
-    print("请安装依赖: pip install huggingface_hub requests")
-    sys.exit(1)
+from huggingface_hub import hf_hub_download
 
 
 @dataclass
@@ -57,7 +47,7 @@ class DownloadTask:
 
 
 class ProgressItemDelegate(QStyledItemDelegate):
-    """自定义进度条委托"""
+    """自定义进度条委托 - 优化版"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -68,21 +58,41 @@ class ProgressItemDelegate(QStyledItemDelegate):
             if progress_data is not None:
                 progress_value = float(progress_data)
 
+                # 绘制进度条背景
+                bg_rect = QRect(option.rect)
+                bg_rect.adjust(2, 2, -2, -2)  # 添加边距
+                painter.fillRect(bg_rect, QColor(45, 45, 45))
+
                 # 绘制进度条
-                progress_rect = QRect(option.rect)
-                progress_rect.setWidth(int(progress_rect.width() * progress_value / 100))
-
-                # 背景
-                painter.fillRect(option.rect, QColor(60, 60, 60))
-
-                # 进度条
                 if progress_value > 0:
-                    color = QColor(42, 130, 218) if progress_value < 100 else QColor(46, 125, 50)
+                    progress_rect = QRect(bg_rect)
+                    progress_rect.setWidth(int(bg_rect.width() * progress_value / 100))
+
+                    # 根据状态选择颜色
+                    status = index.model().data(index.siblingAtColumn(2), Qt.ItemDataRole.DisplayRole)
+                    if status == "已完成":
+                        color = QColor(76, 175, 80)  # 绿色
+                    elif status == "失败":
+                        color = QColor(244, 67, 54)  # 红色
+                    elif status == "下载中":
+                        color = QColor(33, 150, 243)  # 蓝色
+                    elif status == "暂停":
+                        color = QColor(255, 152, 0)  # 橙色
+                    else:
+                        color = QColor(96, 125, 139)  # 灰色
+
                     painter.fillRect(progress_rect, color)
 
-                # 文本
+                # 绘制边框
+                painter.setPen(QColor(80, 80, 80))
+                painter.drawRect(bg_rect)
+
+                # 绘制文本
                 painter.setPen(QColor(255, 255, 255))
-                painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, f"{progress_value:.1f}%")
+                font = painter.font()
+                font.setPointSize(9)
+                painter.setFont(font)
+                painter.drawText(bg_rect, Qt.AlignmentFlag.AlignCenter, f"{progress_value:.1f}%")
                 return
 
         super().paint(painter, option, index)
@@ -96,7 +106,7 @@ class DownloadWorkerSignals(QObject):
 
 
 class SingleDownloadWorker(QRunnable):
-    """单个文件下载工作线程"""
+    """单个文件下载工作线程 - 优化版"""
 
     def __init__(self, task: DownloadTask, proxy_config: Dict, signals: DownloadWorkerSignals):
         super().__init__()
@@ -104,20 +114,47 @@ class SingleDownloadWorker(QRunnable):
         self.proxy_config = proxy_config
         self.signals = signals
         self.is_cancelled = False
+        self._start_time = None
+        self._last_update_time = None
+        self._last_downloaded = 0
+        self._speed_samples = []  # 用于平滑速度计算
 
     def run(self):
         try:
             self.signals.task_started.emit(self.task.task_id)
-            self.signals.progress_updated.emit(
-                self.task.task_id, 0, "0 B/s", "准备下载", 0, 0
-            )
 
-            # 设置代理
-            if self.proxy_config.get('enabled', False):
-                proxy_url = self.proxy_config.get('url', '')
-                if proxy_url:
-                    os.environ['HTTP_PROXY'] = proxy_url
-                    os.environ['HTTPS_PROXY'] = proxy_url
+            # 检查本地文件是否已存在并获取已下载大小
+            local_file_path = self.get_local_file_path()
+            initial_downloaded = 0
+            if local_file_path.exists():
+                initial_downloaded = local_file_path.stat().st_size
+                self.task.downloaded = initial_downloaded
+
+            # 初始化速度计算参数
+            self._start_time = time.time()
+            self._last_update_time = self._start_time
+            self._last_downloaded = initial_downloaded
+
+            # 如果文件已完成，直接返回
+            if self.task.size > 0 and initial_downloaded >= self.task.size:
+                self.signals.progress_updated.emit(
+                    self.task.task_id, 100.0, "已完成", "已完成", initial_downloaded, self.task.size
+                )
+                self.signals.task_completed.emit(
+                    self.task.task_id, True, f"文件已存在: {local_file_path}"
+                )
+                return
+
+            # 发送初始进度（不归零已下载的进度）
+            if self.task.size > 0 and initial_downloaded > 0:
+                initial_progress = (initial_downloaded / self.task.size) * 100
+                self.signals.progress_updated.emit(
+                    self.task.task_id, initial_progress, "准备中", "下载中", initial_downloaded, self.task.size
+                )
+            else:
+                self.signals.progress_updated.emit(
+                    self.task.task_id, 0, "准备中", "下载中", initial_downloaded, 0
+                )
 
             # 创建自定义的下载函数，支持进度回调
             def progress_callback(downloaded: int, total: int):
@@ -136,8 +173,10 @@ class SingleDownloadWorker(QRunnable):
             local_path = self.download_with_progress(progress_callback)
 
             if not self.is_cancelled:
+                # 获取最终文件大小
+                final_size = local_file_path.stat().st_size if local_file_path.exists() else 0
                 self.signals.progress_updated.emit(
-                    self.task.task_id, 100, "完成", "已完成", 0, 0
+                    self.task.task_id, 100, "完成", "已完成", final_size, final_size
                 )
                 self.signals.task_completed.emit(
                     self.task.task_id, True, f"下载完成: {local_path}"
@@ -145,34 +184,29 @@ class SingleDownloadWorker(QRunnable):
 
         except Exception as e:
             self.signals.progress_updated.emit(
-                self.task.task_id, 0, "错误", "失败", 0, 0
+                self.task.task_id, self.task.progress, "错误", "失败", self.task.downloaded, self.task.size
             )
             self.signals.task_completed.emit(
                 self.task.task_id, False, f"下载失败: {str(e)}"
             )
 
+    def get_local_file_path(self) -> Path:
+        """获取本地文件路径"""
+        local_dir = Path(self.task.local_dir) / self.task.repo_id
+        return local_dir / self.task.filename
+
     def download_with_progress(self, progress_callback):
-        """带进度回调的下载函数"""
+        """带进度回调的下载函数 - 优化版"""
         try:
-            # 首先获取文件信息
-            from huggingface_hub import HfApi
-            api = HfApi()
-
-            # 使用自定义下载逻辑
-            import urllib.request
-            from urllib.parse import urljoin
-
             # 构建下载URL
             base_url = f"https://huggingface.co/{self.task.repo_id}/resolve/{self.task.revision}/"
             file_url = urljoin(base_url, self.task.filename)
 
             # 创建本地目录
-            local_dir = Path(self.task.local_dir) / self.task.repo_id
-            local_dir.mkdir(parents=True, exist_ok=True)
+            local_file_path = self.get_local_file_path()
+            local_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-            local_file_path = local_dir / self.task.filename
-
-            # 如果文件已存在，检查是否需要断点续传
+            # 检查是否需要断点续传
             resume_byte_pos = 0
             if local_file_path.exists():
                 resume_byte_pos = local_file_path.stat().st_size
@@ -184,9 +218,15 @@ class SingleDownloadWorker(QRunnable):
 
             # 发送请求
             with urllib.request.urlopen(req) as response:
-                total_size = int(response.headers.get('content-length', 0))
-                if resume_byte_pos > 0:
-                    total_size += resume_byte_pos
+                # 获取文件总大小
+                content_length = response.headers.get('content-length')
+                if content_length:
+                    if resume_byte_pos > 0:
+                        total_size = int(content_length) + resume_byte_pos
+                    else:
+                        total_size = int(content_length)
+                else:
+                    total_size = 0
 
                 downloaded = resume_byte_pos
 
@@ -204,9 +244,12 @@ class SingleDownloadWorker(QRunnable):
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        # 调用进度回调
-                        if not progress_callback(downloaded, total_size):
-                            break
+                        # 调用进度回调（限制更新频率）
+                        current_time = time.time()
+                        if current_time - self._last_update_time >= 0.1:  # 每100ms更新一次
+                            if not progress_callback(downloaded, total_size):
+                                break
+                            self._last_update_time = current_time
 
             return str(local_file_path)
 
@@ -221,20 +264,34 @@ class SingleDownloadWorker(QRunnable):
             )
 
     def calculate_speed(self, downloaded: int) -> str:
-        """计算下载速度"""
-        if not hasattr(self, '_start_time'):
-            self._start_time = time.time()
-            self._last_downloaded = 0
+        """计算下载速度 - 优化版，使用滑动平均"""
+        current_time = time.time()
+
+        if self._last_update_time is None:
+            self._last_update_time = current_time
+            self._last_downloaded = downloaded
             return "0 B/s"
 
-        current_time = time.time()
-        time_diff = current_time - self._start_time
+        time_diff = current_time - self._last_update_time
+        if time_diff <= 0:
+            return self.format_speed(0)
 
-        if time_diff > 0:
-            speed_bps = (downloaded - self._last_downloaded) / time_diff
-            return self.format_speed(speed_bps)
+        # 计算当前速度
+        bytes_diff = downloaded - self._last_downloaded
+        current_speed = bytes_diff / time_diff
 
-        return "0 B/s"
+        # 添加到样本中用于平滑处理
+        self._speed_samples.append(current_speed)
+        if len(self._speed_samples) > 5:  # 保留最近5个样本
+            self._speed_samples.pop(0)
+
+        # 计算平滑速度
+        smooth_speed = sum(self._speed_samples) / len(self._speed_samples)
+
+        self._last_update_time = current_time
+        self._last_downloaded = downloaded
+
+        return self.format_speed(smooth_speed)
 
     def format_speed(self, speed_bps: float) -> str:
         """格式化速度"""
@@ -246,38 +303,6 @@ class SingleDownloadWorker(QRunnable):
 
     def cancel(self):
         self.is_cancelled = True
-
-
-class LoadingDialog(QDialog):
-    """加载对话框"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("正在获取仓库信息")
-        self.setFixedSize(300, 120)
-        self.setModal(True)
-        
-        layout = QVBoxLayout()
-        
-        # 加载文本
-        self.loading_label = QLabel("正在获取仓库文件列表，请稍候...")
-        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.loading_label)
-        
-        # 进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # 设置为不确定模式
-        layout.addWidget(self.progress_bar)
-        
-        # 取消按钮
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        
-        self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(self.cancel_btn)
-        
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
 
 
 class MultiThreadDownloadManager(QObject):
@@ -292,19 +317,20 @@ class MultiThreadDownloadManager(QObject):
         self.active_workers: Dict[str, SingleDownloadWorker] = {}
         self.completed_tasks = 0
         self.total_tasks = 0
+        self.is_downloading = False
+
+        # 只在这里连接一次
+        self.signals.task_completed.connect(self._on_task_completed)
 
     def start_downloads(self, tasks: List[DownloadTask], proxy_config: Dict):
         """开始多线程下载"""
         self.total_tasks = len(tasks)
         self.completed_tasks = 0
+        self.is_downloading = True
 
         for task in tasks:
             worker = SingleDownloadWorker(task, proxy_config, self.signals)
             self.active_workers[task.task_id] = worker
-
-            # 连接完成信号
-            self.signals.task_completed.connect(self._on_task_completed)
-
             self.thread_pool.start(worker)
 
     def _on_task_completed(self, task_id: str, success: bool, message: str):
@@ -314,18 +340,20 @@ class MultiThreadDownloadManager(QObject):
             del self.active_workers[task_id]
 
         if self.completed_tasks >= self.total_tasks:
+            self.is_downloading = False
             self.all_completed.emit()
 
     def cancel_all(self):
         """取消所有下载"""
+        self.is_downloading = False
         for worker in self.active_workers.values():
             worker.cancel()
         self.thread_pool.waitForDone(3000)
         self.active_workers.clear()
 
-
-
-
+    def is_active(self) -> bool:
+        """检查是否有活跃的下载"""
+        return self.is_downloading and len(self.active_workers) > 0
 
 
 class HuggingFaceDownloader(QMainWindow):
@@ -338,9 +366,72 @@ class HuggingFaceDownloader(QMainWindow):
         self.init_ui()
         self.setup_connections()
         self.load_settings()
+        self.load_tasks_from_file()  # 启动时加载任务
+
+    def save_tasks_to_file(self, filename="tasks.json"):
+        data = []
+        for task in self.tasks.values():
+            if task.status == "已完成":
+                continue
+            data.append({
+                "repo_id": task.repo_id,
+                "filename": task.filename,
+                "local_dir": task.local_dir,
+                "revision": task.revision,
+                "status": task.status,
+                "progress": task.progress,
+                "size": task.size,
+                "downloaded": task.downloaded,
+                "speed": task.speed,
+                "task_id": task.task_id,
+            })
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"保存任务文件失败: {e}")
+
+    def load_tasks_from_file(self, filename="tasks.json"):
+        if not os.path.exists(filename):
+            return
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for item in data:
+                if item["status"] == "已完成":
+                    continue
+                task = DownloadTask(**item)
+                # 检查本地文件实际大小
+                local_file_path = os.path.join(task.local_dir, task.repo_id, task.filename)
+                if os.path.exists(local_file_path):
+                    file_size = os.path.getsize(local_file_path)
+                    task.downloaded = file_size
+                    if task.size > 0:
+                        task.progress = (file_size / task.size) * 100
+                        if file_size >= task.size:
+                            task.status = "已完成"
+                        elif task.status not in ["失败"]:
+                            task.status = "待下载"
+                    else:
+                        task.progress = 0
+                        if task.status not in ["失败"]:
+                            task.status = "待下载"
+                else:
+                    # 文件不存在，重置进度
+                    task.downloaded = 0
+                    task.progress = 0
+                    if task.status not in ["失败"]:
+                        task.status = "待下载"
+
+                self.tasks[task.task_id] = task
+            self.update_task_table()
+            self.update_overall_progress()
+            self.log(f"已加载 {len(self.tasks)} 个历史任务")
+        except Exception as e:
+            self.log(f"加载任务文件失败: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("HuggingFace 模型下载器 v2.0 - 多线程增强版")
+        self.setWindowTitle("HuggingFace 模型下载器 v2.1 - 优化版")
         self.setGeometry(100, 100, 1400, 900)
 
         # 中央部件
@@ -462,27 +553,39 @@ class HuggingFaceDownloader(QMainWindow):
 
         task_layout.addWidget(self.task_table)
 
-        # 控制按钮
+        # 控制按钮 - 优化布局
         control_layout = QHBoxLayout()
+
+        # 下载控制按钮组
+        download_controls = QHBoxLayout()
         self.start_btn = QPushButton("🚀 开始下载")
         self.start_btn.clicked.connect(self.start_download)
-        control_layout.addWidget(self.start_btn)
+        download_controls.addWidget(self.start_btn)
 
         self.pause_btn = QPushButton("⏸️ 暂停下载")
         self.pause_btn.clicked.connect(self.pause_download)
         self.pause_btn.setEnabled(False)
-        control_layout.addWidget(self.pause_btn)
+        download_controls.addWidget(self.pause_btn)
 
         self.remove_btn = QPushButton("❌ 移除选中")
         self.remove_btn.clicked.connect(self.remove_selected_tasks)
-        control_layout.addWidget(self.remove_btn)
+        download_controls.addWidget(self.remove_btn)
 
+        control_layout.addLayout(download_controls)
         control_layout.addStretch()
 
-        # 总进度
+        # 总进度显示
+        progress_layout = QHBoxLayout()
+        progress_layout.addWidget(QLabel("总进度:"))
         self.overall_progress = QProgressBar()
-        control_layout.addWidget(QLabel("总进度:"))
-        control_layout.addWidget(self.overall_progress)
+        self.overall_progress.setMinimumWidth(200)
+        progress_layout.addWidget(self.overall_progress)
+
+        # 进度文本标签
+        self.progress_label = QLabel("0/0")
+        progress_layout.addWidget(self.progress_label)
+
+        control_layout.addLayout(progress_layout)
 
         task_layout.addLayout(control_layout)
         task_group.setLayout(task_layout)
@@ -493,7 +596,6 @@ class HuggingFaceDownloader(QMainWindow):
         log_layout = QVBoxLayout()
 
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(150)
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
 
@@ -558,19 +660,14 @@ class HuggingFaceDownloader(QMainWindow):
             return
 
         try:
-            # 设置代理
-            proxy_url = self.proxy_widget.get_proxy_url()
-            if proxy_url:
-                os.environ['HTTP_PROXY'] = proxy_url
-                os.environ['HTTPS_PROXY'] = proxy_url
-
             # 显示加载状态
             self.log("正在获取仓库文件列表...")
             self.browse_btn.setEnabled(False)
             self.browse_btn.setText("获取中...")
 
             # 使用树状文件选择对话框
-            selected_files = HuggingfaceFileDialog.select_files_simple(self.repo_input.text(), self.revision_input.text())
+            selected_files = HuggingfaceFileDialog.select_files_simple(self.repo_input.text(),
+                                                                       self.revision_input.text())
 
             if selected_files:
                 self.files_input.setPlainText('\n'.join(selected_files))
@@ -618,18 +715,27 @@ class HuggingFaceDownloader(QMainWindow):
                 revision=revision
             )
             self.tasks[task.task_id] = task
-
         self.update_task_table()
+        self.save_tasks_to_file()
         self.log(f"已添加 {len(files)} 个下载任务")
 
     def clear_tasks(self):
         """清空任务队列"""
+        if self.download_manager.is_active():
+            QMessageBox.warning(self, "警告", "下载进行中，无法清空队列")
+            return
+
         self.tasks.clear()
         self.update_task_table()
+        self.save_tasks_to_file()
         self.log("已清空任务队列")
 
     def remove_selected_tasks(self):
         """移除选中的任务"""
+        if self.download_manager.is_active():
+            QMessageBox.warning(self, "警告", "下载进行中，无法移除任务")
+            return
+
         selected_rows = set()
         for item in self.task_table.selectedItems():
             selected_rows.add(item.row())
@@ -643,35 +749,57 @@ class HuggingFaceDownloader(QMainWindow):
                 del self.tasks[task_id]
 
         self.update_task_table()
+        self.save_tasks_to_file()
         self.log(f"已移除 {len(selected_rows)} 个任务")
 
     def update_task_table(self):
-        """更新任务表格"""
+        """更新任务表格 - 优化版"""
         self.task_table.setRowCount(len(self.tasks))
 
         for i, (task_id, task) in enumerate(self.tasks.items()):
-            self.task_table.setItem(i, 0, QTableWidgetItem(task.repo_id))
-            self.task_table.setItem(i, 1, QTableWidgetItem(task.filename))
-            self.task_table.setItem(i, 2, QTableWidgetItem(task.status))
+            # 仓库名
+            repo_item = QTableWidgetItem(task.repo_id)
+            self.task_table.setItem(i, 0, repo_item)
+
+            # 文件名
+            file_item = QTableWidgetItem(task.filename)
+            self.task_table.setItem(i, 1, file_item)
+
+            # 状态
+            status_item = QTableWidgetItem(task.status)
+            # 根据状态设置颜色
+            if task.status == "已完成":
+                status_item.setForeground(QColor(76, 175, 80))
+            elif task.status == "失败":
+                status_item.setForeground(QColor(244, 67, 54))
+            elif task.status == "下载中":
+                status_item.setForeground(QColor(33, 150, 243))
+            elif task.status == "暂停":
+                status_item.setForeground(QColor(255, 152, 0))
+            self.task_table.setItem(i, 2, status_item)
 
             # 进度条
             progress_item = QTableWidgetItem(f"{task.progress:.1f}%")
             progress_item.setData(Qt.ItemDataRole.UserRole, task.progress)
             self.task_table.setItem(i, 3, progress_item)
 
+            # 已下载
             downloaded_text = self.format_size(task.downloaded) if task.downloaded > 0 else "--"
             self.task_table.setItem(i, 4, QTableWidgetItem(downloaded_text))
 
+            # 总大小
             size_text = self.format_size(task.size) if task.size > 0 else "--"
             self.task_table.setItem(i, 5, QTableWidgetItem(size_text))
 
+            # 速度
             self.task_table.setItem(i, 6, QTableWidgetItem(task.speed))
 
+            # 保存路径
             local_path = os.path.join(task.local_dir, task.repo_id)
             self.task_table.setItem(i, 7, QTableWidgetItem(local_path))
 
     def start_download(self):
-        """开始下载"""
+        """开始下载 - 优化版"""
         if not self.tasks:
             QMessageBox.warning(self, "警告", "没有下载任务")
             return
@@ -686,6 +814,13 @@ class HuggingFaceDownloader(QMainWindow):
             QMessageBox.information(self, "信息", "所有任务已完成")
             return
 
+        # 开始下载前，更新所有待下载任务的状态
+        for task in pending_tasks:
+            if task.status != "失败":  # 保持失败状态直到重新开始
+                task.status = "准备中"
+
+        self.update_task_table()
+
         self.download_manager.start_downloads(pending_tasks, proxy_config)
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -693,11 +828,20 @@ class HuggingFaceDownloader(QMainWindow):
         self.log(f"开始下载 {len(pending_tasks)} 个任务...")
 
     def pause_download(self):
-        """暂停下载"""
+        """暂停下载 - 优化版"""
         self.download_manager.cancel_all()
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
-        self.log("下载已暂停")
+
+        # 将下载中的任务状态改为暂停，保持进度不变
+        for task in self.tasks.values():
+            if task.status in ["下载中", "准备中"]:
+                task.status = "暂停"
+
+        self.update_task_table()
+        self.update_overall_progress()
+        self.save_tasks_to_file()
+        self.log("下载已暂停，可点击开始下载继续")
 
     def update_concurrent_downloads(self, value: int):
         """更新并发下载数"""
@@ -705,27 +849,36 @@ class HuggingFaceDownloader(QMainWindow):
         self.log(f"并发下载数已设置为: {value}")
 
     def on_task_started(self, task_id: str):
-        """任务开始回调"""
+        """任务开始回调 - 优化版"""
         if task_id in self.tasks:
             self.tasks[task_id].status = "下载中"
             self.update_task_table()
 
     def on_progress_updated(self, task_id: str, progress: float, speed: str,
-                            status: str, downloaded: int, total: int):
-        """进度更新回调"""
+                            status: str, downloaded: int = None, total: int = None):
+        """进度更新回调 - 优化版"""
         if task_id in self.tasks:
             task = self.tasks[task_id]
+
+            # 更新任务信息
             task.progress = progress
             task.speed = speed
             task.status = status
-            task.downloaded = downloaded
-            task.size = total
 
-            self.update_task_table()
-            self.update_overall_progress()
+            if downloaded is not None:
+                task.downloaded = downloaded
+            if total is not None and total > 0:
+                task.size = total
+
+            # 限制UI更新频率
+            current_time = time.time()
+            if not hasattr(self, '_last_ui_update') or current_time - self._last_ui_update > 0.2:
+                self.update_task_table()
+                self.update_overall_progress()
+                self._last_ui_update = current_time
 
     def on_task_completed(self, task_id: str, success: bool, message: str):
-        """任务完成回调"""
+        """任务完成回调 - 优化版"""
         self.log(message)
 
         if task_id in self.tasks:
@@ -733,49 +886,76 @@ class HuggingFaceDownloader(QMainWindow):
             if success:
                 task.status = "已完成"
                 task.progress = 100.0
+                task.speed = "完成"
             else:
                 task.status = "失败"
-                task.progress = 0.0
+                task.speed = "失败"
 
         self.update_task_table()
         self.update_overall_progress()
+        self.save_tasks_to_file()
 
     def on_all_completed(self):
-        """所有任务完成回调"""
+        """所有任务完成回调 - 优化版"""
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
-        self.log("所有下载任务完成")
 
         # 显示完成统计
         completed_count = sum(1 for task in self.tasks.values() if task.status == "已完成")
         failed_count = sum(1 for task in self.tasks.values() if task.status == "失败")
 
-        QMessageBox.information(
-            self, "下载完成",
-            f"下载任务已完成！\n\n"
-            f"成功: {completed_count} 个\n"
-            f"失败: {failed_count} 个\n"
-            f"总计: {len(self.tasks)} 个"
-        )
+        self.log(f"所有下载任务完成 - 成功: {completed_count}, 失败: {failed_count}")
+
+        if failed_count == 0:
+            QMessageBox.information(
+                self, "下载完成",
+                f"🎉 所有下载任务已成功完成！\n\n"
+                f"✅ 成功: {completed_count} 个\n"
+                f"📁 保存位置: {self.dir_input.text()}"
+            )
+        else:
+            QMessageBox.warning(
+                self, "下载完成",
+                f"下载任务已完成！\n\n"
+                f"✅ 成功: {completed_count} 个\n"
+                f"❌ 失败: {failed_count} 个\n"
+                f"💡 可重新点击开始下载重试失败的任务"
+            )
 
     def update_overall_progress(self):
-        """更新总进度"""
+        """更新总进度 - 优化版"""
         if not self.tasks:
             self.overall_progress.setValue(0)
+            self.progress_label.setText("0/0")
             return
 
+        completed_count = sum(1 for task in self.tasks.values() if task.status == "已完成")
+        total_count = len(self.tasks)
+
+        # 计算总体进度
         total_progress = sum(task.progress for task in self.tasks.values())
-        overall = total_progress / len(self.tasks)
+        overall = total_progress / total_count if total_count > 0 else 0
+
         self.overall_progress.setValue(int(overall))
+        self.progress_label.setText(f"{completed_count}/{total_count}")
 
     def log(self, message: str):
-        """添加日志"""
+        """添加日志 - 优化版"""
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
+        formatted_message = f"[{timestamp}] {message}"
+        self.log_text.append(formatted_message)
+
+        # 自动滚动到底部
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
         self.statusBar().showMessage(message)
 
     def format_size(self, size_bytes: int) -> str:
         """格式化文件大小"""
+        if size_bytes == 0:
+            return "0 B"
+
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size_bytes < 1024.0:
                 return f"{size_bytes:.1f} {unit}"
@@ -795,6 +975,7 @@ class HuggingFaceDownloader(QMainWindow):
         self.settings.setValue("proxy_enabled", proxy_config.get('enabled', False))
         self.settings.setValue("proxy_host", proxy_config.get('proxy_host', ''))
         self.settings.setValue("proxy_port", proxy_config.get('proxy_port', ''))
+        self.save_tasks_to_file()
 
     def load_settings(self):
         """加载设置"""
@@ -809,14 +990,15 @@ class HuggingFaceDownloader(QMainWindow):
         self.proxy_widget.proxy_port.setValue(int(self.settings.value("proxy_port", 7890)))
 
     def closeEvent(self, event):
-        """关闭事件"""
+        """关闭事件 - 优化版"""
         self.save_settings()
 
         # 检查是否有正在下载的任务
-        if any(task.status == "下载中" for task in self.tasks.values()):
+        if self.download_manager.is_active():
             reply = QMessageBox.question(
                 self, "确认退出",
-                "有下载正在进行中，确定要退出吗？",
+                "⚠️ 有下载正在进行中，确定要退出吗？\n\n"
+                "💡 下载进度会被保存，下次启动时可以继续",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )

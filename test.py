@@ -1,10 +1,10 @@
 import os
-import time
 import sys
+import time
 from huggingface_hub import HfApi
-from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QPushButton, QWidget, QHBoxLayout
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QTabWidget
 
-from ui.components.tree_file_selection_dialog import SelectionMode, HuggingfaceFileTreeWidget, LocalFileTreeWidget
+from ui.components.tree_file_selection_dialog import SelectionMode, HuggingfaceFileTreeWidget
 
 os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
 os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
@@ -25,10 +25,7 @@ def test_huggingface_api():
     print("模型大小:", repo_info.size)
 
 
-# 使用示例
-if __name__ == "__main__":
-    from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QTabWidget
-    import sys
+def test_huggingface_file_tree_widget():
 
     app = QApplication(sys.argv)
 
