@@ -11,21 +11,22 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
     QLabel, QLineEdit, QPushButton, QTextEdit, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
-    QGroupBox, QCheckBox, QSpinBox, QComboBox, QFileDialog,
-    QMessageBox, QSplitter, QFrame, QScrollArea, QListWidget,
-    QListWidgetItem, QDialog, QGridLayout, QTreeWidget, QTreeWidgetItem,
-    QStyledItemDelegate, QStyleOptionViewItem
+    QGroupBox, QSpinBox, QFileDialog,
+    QMessageBox, QStyledItemDelegate, QStyleOptionViewItem
 )
 from PyQt6.QtCore import (
-    QThread, pyqtSignal, QTimer, Qt, QSettings, QSize, QRect, QMutex,
+    pyqtSignal, Qt, QSettings, QRect,
     QThreadPool, QRunnable, QObject
 )
-from PyQt6.QtGui import QColor, QPainter, QFont
+from PyQt6.QtGui import QColor, QPainter, QIcon
 from urllib.parse import urljoin
 from ui.components.tree_file_selection_dialog import HuggingfaceFileDialog
 from ui.proxy_config_widget import ProxyConfigWidget
 from ui.utils import set_black_ui
 from huggingface_hub import hf_hub_download
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(BASE_DIR, "icon.png")
 
 
 @dataclass
@@ -1050,6 +1051,7 @@ def main():
 
     # 设置应用图标和样式
     app.setStyle('Fusion')
+    app.setWindowIcon(QIcon(ICON_PATH))
 
     # 深色主题
     set_black_ui(app)

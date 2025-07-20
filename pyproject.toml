@@ -13,3 +13,8 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.14.2",
+]
