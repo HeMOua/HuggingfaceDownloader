@@ -4,6 +4,10 @@
 
 HuggingfaceDownloader 是一个基于 PyQt6 的图形界面工具，支持从 [Hugging Face](https://huggingface.co/) 平台批量下载模型文件，具备多线程、断点续传、代理设置、文件树可视化选择等实用功能，适合需要高效管理和下载 Hugging Face 资源的开发者和研究者。
 
+![image-20250720173938173](./img/image-20250720173938173.png)
+
+![image-20250720173933997](./img/image-20250720173933997.png)
+
 ---
 
 ## 主要特性
