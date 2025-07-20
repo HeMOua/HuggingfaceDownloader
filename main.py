@@ -114,13 +114,25 @@ class SingleDownloadWorker(QRunnable):
         self.proxy_config = proxy_config
         self.signals = signals
         self.is_cancelled = False
+        self.manager = None
         self._start_time = None
         self._last_update_time = None
         self._last_downloaded = 0
         self._speed_samples = []  # 用于平滑速度计算
 
     def run(self):
+        # 在开始执行前检查是否已被取消
+        if self.manager and self.manager.is_cancelled():
+            return
+
+        if self.is_cancelled:
+            return
+
         try:
+            # 发送task_started信号前再次检查
+            if self.manager and self.manager.is_cancelled():
+                return
+
             self.signals.task_started.emit(self.task.task_id)
 
             # 检查本地文件是否已存在并获取已下载大小
@@ -318,6 +330,7 @@ class MultiThreadDownloadManager(QObject):
         self.completed_tasks = 0
         self.total_tasks = 0
         self.is_downloading = False
+        self._is_cancelled = False  # 添加全局取消标志
 
         # 只在这里连接一次
         self.signals.task_completed.connect(self._on_task_completed)
@@ -327,9 +340,11 @@ class MultiThreadDownloadManager(QObject):
         self.total_tasks = len(tasks)
         self.completed_tasks = 0
         self.is_downloading = True
+        self._is_cancelled = False  # 重置取消标志
 
         for task in tasks:
             worker = SingleDownloadWorker(task, proxy_config, self.signals)
+            worker.manager = self  # 让worker能够访问manager
             self.active_workers[task.task_id] = worker
             self.thread_pool.start(worker)
 
@@ -345,11 +360,23 @@ class MultiThreadDownloadManager(QObject):
 
     def cancel_all(self):
         """取消所有下载"""
+        self._is_cancelled = True  # 设置全局取消标志
         self.is_downloading = False
+
+        # 取消所有活跃的worker
         for worker in self.active_workers.values():
             worker.cancel()
+
+        # 清空线程池队列中等待的任务
+        self.thread_pool.clear()  # 这会清除队列中等待的任务
+
+        # 等待当前正在执行的任务完成
         self.thread_pool.waitForDone(3000)
         self.active_workers.clear()
+
+    def is_cancelled(self) -> bool:
+        """检查是否已取消"""
+        return self._is_cancelled
 
     def is_active(self) -> bool:
         """检查是否有活跃的下载"""
@@ -431,7 +458,7 @@ class HuggingFaceDownloader(QMainWindow):
             self.log(f"加载任务文件失败: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("HuggingFace 模型下载器 v2.1 - 优化版")
+        self.setWindowTitle("HuggingFace 模型下载器")
         self.setGeometry(100, 100, 1400, 900)
 
         # 中央部件
@@ -806,9 +833,9 @@ class HuggingFaceDownloader(QMainWindow):
 
         proxy_config = self.proxy_widget.get_config()
 
-        # 只下载未完成的任务
+        # 包含待下载、失败和暂停状态的任务
         pending_tasks = [task for task in self.tasks.values()
-                         if task.status in ["待下载", "失败"]]
+                         if task.status in ["待下载", "失败", "暂停"]]
 
         if not pending_tasks:
             QMessageBox.information(self, "信息", "所有任务已完成")
@@ -816,7 +843,9 @@ class HuggingFaceDownloader(QMainWindow):
 
         # 开始下载前，更新所有待下载任务的状态
         for task in pending_tasks:
-            if task.status != "失败":  # 保持失败状态直到重新开始
+            if task.status in ["暂停", "待下载"]:
+                task.status = "准备中"
+            elif task.status == "失败":
                 task.status = "准备中"
 
         self.update_task_table()
@@ -828,15 +857,17 @@ class HuggingFaceDownloader(QMainWindow):
         self.log(f"开始下载 {len(pending_tasks)} 个任务...")
 
     def pause_download(self):
-        """暂停下载 - 优化版"""
+        """暂停下载"""
         self.download_manager.cancel_all()
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
 
-        # 将下载中的任务状态改为暂停，保持进度不变
+        # 只将正在下载的任务设为“暂停”，准备中的任务回退为“待下载”
         for task in self.tasks.values():
-            if task.status in ["下载中", "准备中"]:
+            if task.status == "下载中":
                 task.status = "暂停"
+            elif task.status == "准备中":
+                task.status = "待下载"
 
         self.update_task_table()
         self.update_overall_progress()
