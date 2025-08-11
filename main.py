@@ -109,11 +109,12 @@ class DownloadWorkerSignals(QObject):
 class SingleDownloadWorker(QRunnable):
     """单个文件下载工作线程 - 优化版"""
 
-    def __init__(self, task: DownloadTask, proxy_config: Dict, signals: DownloadWorkerSignals):
+    def __init__(self, task: DownloadTask, proxy_config: Dict, signals: DownloadWorkerSignals, token: str = None):
         super().__init__()
         self.task = task
         self.proxy_config = proxy_config
         self.signals = signals
+        self.token = token  # 添加token支持
         self.is_cancelled = False
         self.manager = None
         self._start_time = None
@@ -214,6 +215,11 @@ class SingleDownloadWorker(QRunnable):
             # 构建下载URL
             base_url = f"https://huggingface.co/{self.task.repo_id}/resolve/{self.task.revision}/"
             file_url = urljoin(base_url, self.task.filename)
+            
+            # 如果有token，添加到请求头中
+            headers = {}
+            if self.token:
+                headers['Authorization'] = f'Bearer {self.token}'
 
             # 创建本地目录
             local_file_path = self.get_local_file_path()
@@ -228,6 +234,10 @@ class SingleDownloadWorker(QRunnable):
             req = urllib.request.Request(file_url)
             if resume_byte_pos > 0:
                 req.add_header('Range', f'bytes={resume_byte_pos}-')
+                
+            # 添加token认证头
+            if self.token:
+                req.add_header('Authorization', f'Bearer {self.token}')
 
             # 发送请求
             with urllib.request.urlopen(req) as response:
@@ -267,13 +277,14 @@ class SingleDownloadWorker(QRunnable):
             return str(local_file_path)
 
         except Exception as e:
-            # fallback到原始方法
+            # fallback到原始方法，添加token支持
             return hf_hub_download(
                 repo_id=self.task.repo_id,
                 filename=self.task.filename,
                 local_dir=self.task.local_dir,
                 revision=self.task.revision,
-                resume_download=True
+                resume_download=True,
+                token=self.token  # 使用token进行认证
             )
 
     def calculate_speed(self, downloaded: int) -> str:
@@ -336,7 +347,7 @@ class MultiThreadDownloadManager(QObject):
         # 只在这里连接一次
         self.signals.task_completed.connect(self._on_task_completed)
 
-    def start_downloads(self, tasks: List[DownloadTask], proxy_config: Dict):
+    def start_downloads(self, tasks: List[DownloadTask], proxy_config: Dict, token: str = None):
         """开始多线程下载"""
         self.total_tasks = len(tasks)
         self.completed_tasks = 0
@@ -344,7 +355,7 @@ class MultiThreadDownloadManager(QObject):
         self._is_cancelled = False  # 重置取消标志
 
         for task in tasks:
-            worker = SingleDownloadWorker(task, proxy_config, self.signals)
+            worker = SingleDownloadWorker(task, proxy_config, self.signals, token)
             worker.manager = self  # 让worker能够访问manager
             self.active_workers[task.task_id] = worker
             self.thread_pool.start(worker)
@@ -667,10 +678,48 @@ class HuggingFaceDownloader(QMainWindow):
 
         download_group.setLayout(download_layout)
         layout.addWidget(download_group)
+        
+        # Huggingface认证设置
+        auth_group = QGroupBox("Huggingface认证")
+        auth_layout = QVBoxLayout()
+        
+        # Token设置
+        token_layout = QHBoxLayout()
+        token_layout.addWidget(QLabel("Access Token:"))
+        self.token_input = QLineEdit()
+        self.token_input.setPlaceholderText("输入Huggingface Access Token以访问私有模型")
+        self.token_input.setEchoMode(QLineEdit.EchoMode.Password)  # 密码模式显示
+        token_layout.addWidget(self.token_input)
+        
+        # 显示/隐藏Token按钮
+        self.toggle_token_btn = QPushButton("显示")
+        self.toggle_token_btn.setMaximumWidth(60)
+        self.toggle_token_btn.clicked.connect(self.toggle_token_visibility)
+        token_layout.addWidget(self.toggle_token_btn)
+        
+        auth_layout.addLayout(token_layout)
+        
+        # 添加说明标签
+        token_info = QLabel("注意: 访问令牌用于下载需要登录的私有模型，可从Huggingface网站的设置页面获取。")
+        token_info.setWordWrap(True)
+        token_info.setStyleSheet("color: #888; font-size: 11px;")
+        auth_layout.addWidget(token_info)
+        
+        auth_group.setLayout(auth_layout)
+        layout.addWidget(auth_group)
 
         layout.addStretch()
         widget.setLayout(layout)
         return widget
+        
+    def toggle_token_visibility(self):
+        """切换Token显示/隐藏状态"""
+        if self.token_input.echoMode() == QLineEdit.EchoMode.Password:
+            self.token_input.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.toggle_token_btn.setText("隐藏")
+        else:
+            self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self.toggle_token_btn.setText("显示")
 
     def setup_connections(self):
         """设置信号连接"""
@@ -692,10 +741,16 @@ class HuggingFaceDownloader(QMainWindow):
             self.log("正在获取仓库文件列表...")
             self.browse_btn.setEnabled(False)
             self.browse_btn.setText("获取中...")
+            
+            # 获取token
+            token = self.token_input.text().strip()
 
-            # 使用树状文件选择对话框
-            selected_files = HuggingfaceFileDialog.select_files_simple(self.repo_input.text(),
-                                                                       self.revision_input.text())
+            # 使用树状文件选择对话框，传入token
+            selected_files = HuggingfaceFileDialog.select_files_simple(
+                self.repo_input.text(),
+                self.revision_input.text(),
+                token=token if token else None
+            )
 
             if selected_files:
                 self.files_input.setPlainText('\n'.join(selected_files))
@@ -833,6 +888,9 @@ class HuggingFaceDownloader(QMainWindow):
             return
 
         proxy_config = self.proxy_widget.get_config()
+        
+        # 获取token
+        token = self.token_input.text().strip() if hasattr(self, 'token_input') else None
 
         # 包含待下载、失败和暂停状态的任务
         pending_tasks = [task for task in self.tasks.values()
@@ -851,7 +909,8 @@ class HuggingFaceDownloader(QMainWindow):
 
         self.update_task_table()
 
-        self.download_manager.start_downloads(pending_tasks, proxy_config)
+        # 传入token参数
+        self.download_manager.start_downloads(pending_tasks, proxy_config, token)
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
 
@@ -1001,6 +1060,9 @@ class HuggingFaceDownloader(QMainWindow):
         self.settings.setValue("revision", self.revision_input.text())
         self.settings.setValue("concurrent_downloads", self.concurrent_spin.value())
         self.settings.setValue("retry_count", self.retry_spin.value())
+        
+        # 保存Huggingface Token
+        self.settings.setValue("hf_token", self.token_input.text())
 
         # 保存代理设置
         proxy_config = self.proxy_widget.get_config()
@@ -1016,6 +1078,9 @@ class HuggingFaceDownloader(QMainWindow):
         self.revision_input.setText(self.settings.value("revision", "main"))
         self.concurrent_spin.setValue(int(self.settings.value("concurrent_downloads", 4)))
         self.retry_spin.setValue(int(self.settings.value("retry_count", 3)))
+        
+        # 加载Huggingface Token
+        self.token_input.setText(self.settings.value("hf_token", ""))
 
         self.proxy_widget.proxy_enabled.setChecked(bool(self.settings.value("proxy_enabled", False)))
         self.proxy_widget.proxy_host.setText(self.settings.value("proxy_host", ""))
