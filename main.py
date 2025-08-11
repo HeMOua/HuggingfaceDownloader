@@ -447,6 +447,9 @@ class HuggingFaceDownloader(QMainWindow):
         try:
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                # 确保文件立即写入磁盘
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as e:
             self.log(f"保存任务文件失败: {e}")
 
@@ -719,10 +722,11 @@ class HuggingFaceDownloader(QMainWindow):
         
         auth_layout.addLayout(token_layout)
         
-        # 添加说明标签
-        token_info = QLabel("注意: 访问令牌用于下载需要登录的私有模型，可从Huggingface网站的设置页面获取。")
+        # 添加说明标签（带可点击链接）
+        token_info = QLabel("注意: 访问令牌用于下载需要登录的私有模型，可从Huggingface网站的<a href=\"https://huggingface.co/settings/tokens\">https://huggingface.co/settings/tokens</a>获取。")
         token_info.setWordWrap(True)
         token_info.setStyleSheet("color: #888; font-size: 11px;")
+        token_info.setOpenExternalLinks(True)  # 允许打开外部链接
         auth_layout.addWidget(token_info)
         
         auth_group.setLayout(auth_layout)
@@ -1089,6 +1093,10 @@ class HuggingFaceDownloader(QMainWindow):
         self.settings.setValue("proxy_enabled", proxy_config.get('enabled', False))
         self.settings.setValue("proxy_host", proxy_config.get('proxy_host', ''))
         self.settings.setValue("proxy_port", proxy_config.get('proxy_port', ''))
+        
+        # 立即同步设置到磁盘
+        self.settings.sync()
+        
         self.save_tasks_to_file()
 
     def load_settings(self):
