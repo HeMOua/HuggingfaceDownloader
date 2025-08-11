@@ -220,6 +220,9 @@ class SingleDownloadWorker(QRunnable):
             headers = {}
             if self.token:
                 headers['Authorization'] = f'Bearer {self.token}'
+                print(f"使用token进行认证: {self.token[:5]}...{self.token[-5:] if len(self.token) > 10 else ''}")
+            else:
+                print("未使用token进行认证")
 
             # 创建本地目录
             local_file_path = self.get_local_file_path()
@@ -231,13 +234,24 @@ class SingleDownloadWorker(QRunnable):
                 resume_byte_pos = local_file_path.stat().st_size
 
             # 创建请求
+            # 创建基本请求对象
             req = urllib.request.Request(file_url)
+            
+            # 添加所有头部信息
+            for header, value in headers.items():
+                req.add_header(header, value)
+                
+            # 如果需要断点续传，添加Range头
             if resume_byte_pos > 0:
                 req.add_header('Range', f'bytes={resume_byte_pos}-')
                 
-            # 添加token认证头
-            if self.token:
-                req.add_header('Authorization', f'Bearer {self.token}')
+            # 打印请求头信息，用于调试
+            print(f"请求URL: {file_url}")
+            print(f"请求头: {req.headers}")
+            if 'Authorization' in req.headers:
+                print("已包含Authorization头")
+            else:
+                print("未包含Authorization头")
 
             # 发送请求
             with urllib.request.urlopen(req) as response:
@@ -278,6 +292,12 @@ class SingleDownloadWorker(QRunnable):
 
         except Exception as e:
             # fallback到原始方法，添加token支持
+            print(f"使用fallback方法下载: {self.task.filename}")
+            if self.token:
+                print(f"fallback方法使用token进行认证: {self.token[:5]}...{self.token[-5:] if len(self.token) > 10 else ''}")
+            else:
+                print("fallback方法未使用token进行认证")
+                
             return hf_hub_download(
                 repo_id=self.task.repo_id,
                 filename=self.task.filename,
